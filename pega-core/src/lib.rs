@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicUsize, Ordering},
+    sync::Arc,
+};
 
 use cudarc::driver::CudaContext;
 use tracing::{debug, info, instrument};
@@ -9,6 +13,10 @@ pub struct PegaEngine {
     kv_caches: HashMap<String, KVCacheRegistration>,
     /// Store saved KV blocks: (layer_name, block_hash) -> block data
     kv_storage: HashMap<(String, Vec<u8>), Block>,
+    /// Pinned memory pool for zero-copy GPU transfers
+    pinned_pool_ptr: *mut u8,
+    pinned_pool_size: usize,
+    pinned_pool_offset: AtomicUsize,
 }
 
 #[derive(Debug, Clone)]
@@ -26,19 +34,44 @@ pub struct KVCacheRegistration {
 
 #[derive(Clone)]
 pub struct Block {
-    pub data: Vec<u8>,
+    /// Pointer to pinned memory (not owned, managed by PegaEngine's pool)
+    pub ptr: *mut u8,
+    pub size: usize,
 }
 
 impl PegaEngine {
     /// Create a new PegaEngine instance
     #[instrument(level = "info")]
     pub fn new() -> Self {
+        use cudarc::driver::sys;
+
         // default device is 0
         let context = cudarc::driver::CudaContext::new(0).unwrap();
+
+        // Allocate 10GB pinned memory pool
+        let pool_size = 10 * 1024 * 1024 * 1024; // 10GB
+        let mut pool_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+
+        unsafe {
+            let result = sys::cuMemAllocHost_v2(&mut pool_ptr, pool_size);
+            if result != sys::cudaError_enum::CUDA_SUCCESS {
+                panic!("Failed to allocate pinned memory pool: {:?}", result);
+            }
+        }
+
+        info!(
+            "Allocated pinned memory pool: {} GB ({} bytes)",
+            pool_size as f64 / 1e9,
+            pool_size
+        );
+
         PegaEngine {
             context,
             kv_caches: HashMap::new(),
             kv_storage: HashMap::new(),
+            pinned_pool_ptr: pool_ptr as *mut u8,
+            pinned_pool_size: pool_size,
+            pinned_pool_offset: AtomicUsize::new(0),
         }
     }
 
@@ -86,6 +119,25 @@ impl PegaEngine {
         self.kv_caches.len()
     }
 
+    /// Allocate pinned memory from the pool (bump allocator, no deallocation)
+    fn allocate_pinned(&self, size: usize) -> *mut u8 {
+        let offset = self.pinned_pool_offset.fetch_add(size, Ordering::SeqCst);
+        if offset + size > self.pinned_pool_size {
+            panic!(
+                "Pinned memory pool exhausted! Used: {:.2} GB / {:.2} GB",
+                (offset + size) as f64 / 1e9,
+                self.pinned_pool_size as f64 / 1e9
+            );
+        }
+        unsafe { self.pinned_pool_ptr.add(offset) }
+    }
+
+    /// Get pinned memory usage statistics
+    pub fn get_pinned_memory_usage(&self) -> (usize, usize) {
+        let used = self.pinned_pool_offset.load(Ordering::SeqCst);
+        (used, self.pinned_pool_size)
+    }
+
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
@@ -118,25 +170,7 @@ impl PegaEngine {
                 ));
             }
 
-            // Copy each segment (K/V) for this block
-            let mut combined = Vec::with_capacity(
-                registration
-                    .bytes_per_block
-                    .checked_mul(registration.segments)
-                    .ok_or_else(|| "Block size overflow".to_string())?,
-            );
-            for segment_idx in 0..registration.segments {
-                let offset = self.segment_offset(&registration, block_idx, segment_idx)?;
-                let mut buffer = vec![0u8; registration.bytes_per_block];
-                self.copy_gpu_to_cpu(
-                    registration.data_ptr,
-                    offset,
-                    &mut buffer,
-                    registration.bytes_per_block,
-                )?;
-                combined.extend_from_slice(&buffer);
-            }
-
+            // Skip if already stored
             if self
                 .kv_storage
                 .contains_key(&(layer_name.clone(), block_hash.clone()))
@@ -144,10 +178,42 @@ impl PegaEngine {
                 continue;
             }
 
+            // Allocate pinned memory for this block
+            let block_size = registration
+                .bytes_per_block
+                .checked_mul(registration.segments)
+                .ok_or_else(|| "Block size overflow".to_string())?;
+
+            let cpu_ptr = self.allocate_pinned(block_size);
+
+            // Copy each segment (K/V) directly to pinned memory
+            for segment_idx in 0..registration.segments {
+                let offset = self.segment_offset(&registration, block_idx, segment_idx)?;
+                let segment_offset = segment_idx * registration.bytes_per_block;
+                let dst_ptr = unsafe { cpu_ptr.add(segment_offset) };
+
+                // Create a slice for the destination
+                let buffer = unsafe {
+                    std::slice::from_raw_parts_mut(dst_ptr, registration.bytes_per_block)
+                };
+
+                self.copy_gpu_to_cpu(
+                    registration.data_ptr,
+                    offset,
+                    buffer,
+                    registration.bytes_per_block,
+                )?;
+            }
+
             info!("insert key {}-{:?} to kv_storage", layer_name, block_hash);
 
-            self.kv_storage
-                .insert((layer_name.clone(), block_hash), Block { data: combined });
+            self.kv_storage.insert(
+                (layer_name.clone(), block_hash),
+                Block {
+                    ptr: cpu_ptr,
+                    size: block_size,
+                },
+            );
         }
 
         Ok(())
@@ -183,7 +249,7 @@ impl PegaEngine {
     #[instrument(level = "info", skip(self), ret)]
     pub fn get_storage_stats(&self) -> (usize, usize) {
         let num_blocks = self.kv_storage.len();
-        let total_bytes: usize = self.kv_storage.values().map(|block| block.data.len()).sum();
+        let total_bytes: usize = self.kv_storage.values().map(|block| block.size).sum();
         (num_blocks, total_bytes)
     }
 
@@ -281,20 +347,23 @@ impl PegaEngine {
                 .bytes_per_block
                 .checked_mul(registration.segments)
                 .ok_or_else(|| "Stored block size overflow".to_string())?;
-            if block.data.len() != expected_size {
+            if block.size != expected_size {
                 return Err(format!(
                     "Stored block size mismatch for layer {}: {} vs {}",
-                    layer_name,
-                    block.data.len(),
-                    expected_size
+                    layer_name, block.size, expected_size
                 ));
             }
 
+            // Copy each segment from pinned memory to GPU
             for segment_idx in 0..registration.segments {
                 let offset = self.segment_offset(&registration, block_idx, segment_idx)?;
-                let start = segment_idx * registration.bytes_per_block;
-                let end = start + registration.bytes_per_block;
-                let segment = &block.data[start..end];
+                let segment_offset = segment_idx * registration.bytes_per_block;
+                let src_ptr = unsafe { block.ptr.add(segment_offset) };
+
+                // Create a slice from pinned memory
+                let segment =
+                    unsafe { std::slice::from_raw_parts(src_ptr, registration.bytes_per_block) };
+
                 self.copy_cpu_to_gpu(
                     registration.data_ptr,
                     offset,
@@ -383,6 +452,29 @@ impl Default for PegaEngine {
         Self::new()
     }
 }
+
+impl Drop for PegaEngine {
+    fn drop(&mut self) {
+        use cudarc::driver::sys;
+
+        if !self.pinned_pool_ptr.is_null() {
+            unsafe {
+                let result = sys::cuMemFreeHost(self.pinned_pool_ptr as *mut std::ffi::c_void);
+                if result != sys::cudaError_enum::CUDA_SUCCESS {
+                    eprintln!("Warning: Failed to free pinned memory pool: {:?}", result);
+                }
+            }
+            info!("Freed pinned memory pool");
+        }
+    }
+}
+
+// Safety: PegaEngine can be safely sent between threads
+// - pinned_pool_ptr is managed exclusively by this struct
+// - AtomicUsize provides thread-safe access to the offset
+// - CUDA context is thread-safe (Arc<CudaContext>)
+unsafe impl Send for PegaEngine {}
+unsafe impl Sync for PegaEngine {}
 
 #[cfg(test)]
 mod tests {

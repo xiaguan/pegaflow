@@ -139,6 +139,12 @@ impl PegaEngine {
             .load_kv_blocks_to_ipc(layer_name, block_ids, block_hashes)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
+
+    /// Get pinned memory usage statistics
+    /// Returns (used_bytes, total_bytes)
+    fn get_pinned_memory_usage(&self) -> (usize, usize) {
+        self.engine.get_pinned_memory_usage()
+    }
 }
 
 /// A Python module implemented in Rust.

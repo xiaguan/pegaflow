@@ -132,6 +132,8 @@ class PegaKVConnector(KVConnectorBase_V1):
             the same.
 
         """
+        import time
+
         # ============================================================
         # STEP 1: Get connector metadata
         # ============================================================
@@ -152,6 +154,10 @@ class PegaKVConnector(KVConnectorBase_V1):
         # STEP 3: Load KV blocks for each request and each layer
         # ============================================================
         try:
+            total_start = time.perf_counter()
+            total_blocks = 0
+            total_layers = 0
+
             for req_id, load_info in metadata.requests_to_load.items():
                 block_ids = load_info['block_ids']
                 block_hashes = load_info['block_hashes']
@@ -174,6 +180,8 @@ class PegaKVConnector(KVConnectorBase_V1):
                             block_ids,
                             block_hashes
                         )
+                        total_blocks += len(block_ids)
+                        total_layers += 1
                         print(f"[PegaKVConnector] Loaded layer {layer_name} for request {req_id}")
 
                     except Exception as e:
@@ -184,7 +192,23 @@ class PegaKVConnector(KVConnectorBase_V1):
             # STEP 4: Synchronize CUDA operations
             # ============================================================
             torch.cuda.synchronize()
-            print(f"[PegaKVConnector] start_load_kv: All loads complete")
+            total_end = time.perf_counter()
+            total_time_ms = (total_end - total_start) * 1000
+
+            # Get pinned memory usage
+            used_bytes, total_bytes = self.engine.get_pinned_memory_usage()
+            used_gb = used_bytes / 1e9
+            total_gb = total_bytes / 1e9
+            usage_pct = (used_bytes / total_bytes * 100) if total_bytes > 0 else 0
+
+            print(f"[PegaKVConnector] ===== LOAD SUMMARY =====")
+            print(f"[PegaKVConnector] Total time: {total_time_ms:.2f} ms")
+            print(f"[PegaKVConnector] Total layers: {total_layers}")
+            print(f"[PegaKVConnector] Total blocks: {total_blocks}")
+            if total_blocks > 0:
+                print(f"[PegaKVConnector] Avg time per block: {total_time_ms / total_blocks:.2f} ms")
+            print(f"[PegaKVConnector] Pinned memory: {used_gb:.2f} GB / {total_gb:.2f} GB ({usage_pct:.1f}%)")
+            print(f"[PegaKVConnector] =======================")
 
         except Exception as e:
             print(f"[PegaKVConnector] Error in start_load_kv: {e}")
@@ -238,6 +262,8 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         This prevents overwrites of paged KV buffer before saving done.
         """
+        import time
+
         # ============================================================
         # STEP 1: Check if there are pending saves
         # ============================================================
@@ -245,6 +271,8 @@ class PegaKVConnector(KVConnectorBase_V1):
             return
 
         try:
+            total_start = time.perf_counter()
+
             # ============================================================
             # STEP 2: Get connector metadata
             # ============================================================
@@ -264,6 +292,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             # STEP 4: Process each layer's save operation
             # ============================================================
             total_blocks_saved = 0
+            total_layers_saved = 0
 
             for save_info in self._pending_saves:
                 layer_name = save_info['layer_name']
@@ -275,6 +304,8 @@ class PegaKVConnector(KVConnectorBase_V1):
 
                 block_table = attn_metadata.block_table  # [num_seqs, max_blocks]
                 seq_lens = attn_metadata.seq_lens
+
+                layer_blocks_saved = 0
 
                 # Process each sequence in the batch
                 for seq_idx in range(block_table.shape[0]):
@@ -314,15 +345,36 @@ class PegaKVConnector(KVConnectorBase_V1):
                             active_blocks,
                             block_hashes_for_seq
                         )
-                        total_blocks_saved += len(block_hashes_for_seq)
+                        layer_blocks_saved += len(block_hashes_for_seq)
                     except Exception:
                         # Silently skip failed saves
                         pass
+
+                if layer_blocks_saved > 0:
+                    total_blocks_saved += layer_blocks_saved
+                    total_layers_saved += 1
 
             # ============================================================
             # STEP 5: Wait for CUDA operations to complete
             # ============================================================
             event.synchronize()
+            total_end = time.perf_counter()
+            total_time_ms = (total_end - total_start) * 1000
+
+            if total_blocks_saved > 0:
+                # Get pinned memory usage
+                used_bytes, total_bytes = self.engine.get_pinned_memory_usage()
+                used_gb = used_bytes / 1e9
+                total_gb = total_bytes / 1e9
+                usage_pct = (used_bytes / total_bytes * 100) if total_bytes > 0 else 0
+
+                print(f"[PegaKVConnector] ===== SAVE SUMMARY =====")
+                print(f"[PegaKVConnector] Total time: {total_time_ms:.2f} ms")
+                print(f"[PegaKVConnector] Total layers: {total_layers_saved}")
+                print(f"[PegaKVConnector] Total blocks: {total_blocks_saved}")
+                print(f"[PegaKVConnector] Avg time per block: {total_time_ms / total_blocks_saved:.2f} ms")
+                print(f"[PegaKVConnector] Pinned memory: {used_gb:.2f} GB / {total_gb:.2f} GB ({usage_pct:.1f}%)")
+                print(f"[PegaKVConnector] =======================")
 
         except Exception:
             # Silently handle errors

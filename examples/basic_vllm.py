@@ -78,13 +78,16 @@ def main():
     )
     print("✓ Model loaded successfully!")
 
-    # Test prompt - use the same prompt twice
-    prompt = "Hello, how are u today? I'm fine, thank you. And you? Ha ha ha"
+    # Test prompt - use a long prompt (~2048 characters)
+    print("\n[Generating long prompt (~2048 chars)...]")
+    prompt = generate_long_prompt(2048)
+    print(f"✓ Generated prompt with {len(prompt)} characters")
+    print(f"Preview: {prompt[:100]}...")
 
     # Sampling parameters - use temperature=0 for deterministic output
     sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic
-        max_tokens=30,
+        max_tokens=1,
     )
 
     # First run: Generate and save KV cache
@@ -96,7 +99,8 @@ def main():
     first_run_time = time.time() - start_time
 
     first_output = outputs[0].outputs[0].text
-    print(f"\nPrompt: {prompt}")
+    print(f"\nPrompt length: {len(prompt)} chars")
+    print(f"Prompt preview: {prompt[:100]}...")
     print(f"Generated: {first_output}")
     print(f"Time: {first_run_time:.3f}s")
 
@@ -109,7 +113,8 @@ def main():
     second_run_time = time.time() - start_time
 
     second_output = outputs[0].outputs[0].text
-    print(f"\nPrompt: {prompt}")
+    print(f"\nPrompt length: {len(prompt)} chars")
+    print(f"Prompt preview: {prompt[:100]}...")
     print(f"Generated: {second_output}")
     print(f"Time: {second_run_time:.3f}s")
 
