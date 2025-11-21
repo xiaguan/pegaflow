@@ -153,6 +153,12 @@ impl PegaEngine {
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
+    /// Wait until the async transfer for `layer_name` completes.
+    fn wait_for_layer_transfer(&self, py: Python<'_>, layer_name: String) -> PyResult<()> {
+        py.allow_threads(|| self.engine.wait_for_layer_transfer(&layer_name))
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    }
+
     /// Batch load KV blocks for multiple layers using the same block mapping
     ///
     /// This is much more efficient than calling load_kv_blocks_to_ipc in a loop

@@ -48,6 +48,7 @@ logger.setLevel(logging.INFO)
 # Environment variable to control timing logging
 _ENABLE_TIMING = os.environ.get("PEGAFLOW_ENABLE_TIMING", "1") == "1"
 
+
 def timing_wrapper(func):
     """Decorator to log function name and execution time when enabled.
 
@@ -212,36 +213,33 @@ class PegaKVConnector(KVConnectorBase_V1):
             if not all_block_ids:
                 return
 
-            # Identify all KV cache layers
+            # Identify all KV cache layers in the order provided by vLLM
             target_layers: List[str] = []
             for layer_name, layer in forward_context.no_compile_layers.items():
                 if hasattr(layer, 'kv_cache'):
                     target_layers.append(layer_name)
-            
-            # Batch load for all layers in one Rust call
+
+            if not target_layers:
+                return
+
+            # Batch load for all layers with async transfers
             num_layers_loaded, total_bytes = self.engine.batch_load_kv_blocks(
                 target_layers,
                 all_block_ids,
                 all_block_hashes
             )
-            
+
             total_blocks = len(all_block_ids) * num_layers_loaded
             total_layers = num_layers_loaded
 
             transfer_end = time.perf_counter()
-            # ============================================================
-            # STEP 4: Synchronize CUDA operations
-            # ============================================================
-            torch.cuda.synchronize()
-            total_end = time.perf_counter()
-
-            total_time_us = (total_end - load_start) * 1e6
+            total_time_us = (transfer_end - load_start) * 1e6
             total_time_s = total_time_us / 1e6
             bandwidth_gbps = (total_bytes / 1e9) / total_time_s if total_time_s > 0 else 0.0
 
             logger.info(
-                "[PegaKVConnector] loaded %d blocks (%.2f GB) across %d layers for %d reqs, "
-                "cost %.0f us (%.2f GB/s)",
+                "[PegaKVConnector] queued %d blocks (%.2f GB) across %d layers for %d reqs, "
+                "schedule %.0f us (%.2f GB/s)",
                 total_blocks,
                 total_bytes / 1e9,
                 num_layers_loaded,
@@ -268,7 +266,15 @@ class PegaKVConnector(KVConnectorBase_V1):
         Args:
             layer_name: the name of that layer
         """
-        pass
+        try:
+            self.engine.wait_for_layer_transfer(layer_name)
+        except Exception as exc:
+            logger.debug(
+                "[PegaKVConnector] wait_for_layer_load failed for %s: %s",
+                layer_name,
+                exc,
+                exc_info=True,
+            )
 
     def save_kv_layer(
         self,

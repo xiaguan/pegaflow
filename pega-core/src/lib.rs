@@ -16,9 +16,14 @@ pub mod pinned_pool;
 // for other layouts without breaking this contract.
 // ============================================================================
 
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use allocator::Allocation;
+use cudarc::driver::{CudaContext, CudaEvent, CudaStream};
 use moka::sync::Cache;
 use tracing::{debug, info, instrument};
 
@@ -29,12 +34,6 @@ const CACHE_USAGE_RATIO: f64 = 0.90;
 
 type BlockKey = (String, Vec<u8>);
 
-struct PendingBlock {
-    block_idx: usize,
-    key: BlockKey,
-    slot: usize,
-}
-
 pub struct PegaEngine {
     /// Store registered KV cache pointers (new IPC wrapper): layer_name -> registration
     kv_caches: HashMap<String, KVCacheRegistration>,
@@ -42,6 +41,24 @@ pub struct PegaEngine {
     kv_storage: Cache<BlockKey, Arc<Block>>,
     /// Pinned memory pool for zero-copy GPU transfers
     pinned_pool: Arc<PinnedMemoryPool>,
+    /// Track per-layer transfer streams/events for async loading
+    layer_transfers: Mutex<HashMap<String, LayerTransferState>>,
+    // context
+    cuda_ctx: Arc<CudaContext>,
+}
+
+struct LayerTransferState {
+    stream: Arc<CudaStream>,
+    last_event: Option<CudaEvent>,
+}
+
+impl LayerTransferState {
+    fn new(stream: Arc<CudaStream>) -> Self {
+        Self {
+            stream,
+            last_event: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -124,10 +141,15 @@ impl PegaEngine {
             .weigher(|_, block: &Arc<Block>| block.weight())
             .build();
 
+        // TODO: hard code device 0 for now
+        let cuda_ctx = cudarc::driver::CudaContext::new(0).unwrap();
+
         PegaEngine {
             kv_caches: HashMap::new(),
             kv_storage,
             pinned_pool,
+            layer_transfers: Mutex::new(HashMap::new()),
+            cuda_ctx: cuda_ctx,
         }
     }
 
@@ -183,6 +205,48 @@ impl PegaEngine {
     /// Get pinned memory usage statistics
     pub fn get_pinned_memory_usage(&self) -> (usize, usize) {
         self.pinned_pool.usage()
+    }
+
+    fn ensure_layer_stream(&self, layer_name: &str) -> Result<Arc<CudaStream>, String> {
+        let mut guard = self
+            .layer_transfers
+            .lock()
+            .expect("layer transfer map poisoned");
+
+        if let Some(state) = guard.get(layer_name) {
+            return Ok(state.stream.clone());
+        }
+
+        let stream = self
+            .cuda_ctx
+            .new_stream()
+            .map_err(|e| format!("Failed to create stream for {layer_name}: {e:?}"))?;
+        guard.insert(
+            layer_name.to_string(),
+            LayerTransferState::new(stream.clone()),
+        );
+        Ok(stream)
+    }
+
+    fn record_layer_event(&self, layer_name: &str, stream: &Arc<CudaStream>, event: CudaEvent) {
+        let mut guard = self
+            .layer_transfers
+            .lock()
+            .expect("layer transfer map poisoned");
+
+        if let Some(state) = guard.get_mut(layer_name) {
+            state.stream = stream.clone();
+            state.last_event = Some(event);
+            return;
+        }
+
+        guard.insert(
+            layer_name.to_string(),
+            LayerTransferState {
+                stream: stream.clone(),
+                last_event: Some(event),
+            },
+        );
     }
 
     #[instrument(
@@ -433,51 +497,26 @@ impl PegaEngine {
         block_hashes: &[Vec<u8>],
     ) -> Result<usize, String> {
         let start_time = Instant::now();
-        if block_ids.len() != block_hashes.len() {
-            return Err("block_ids and block_hashes must have equal length".into());
-        }
-
-        let Some(registration) = self.kv_caches.get(layer_name) else {
-            return Err(format!("Layer {} not registered", layer_name));
-        };
+        let registration = self
+            .kv_caches
+            .get(layer_name)
+            .ok_or_else(|| format!("Layer {} not registered", layer_name))?;
 
         // Collect valid blocks to load
-        let mut blocks_to_load = Vec::new();
+        let mut blocks_to_load = Vec::with_capacity(block_ids.len());
         for (block_id, block_hash) in block_ids.iter().zip(block_hashes.iter()) {
-            if *block_id < 0 {
-                continue;
-            }
-
             let block_idx = *block_id as usize;
-            if block_idx >= registration.num_blocks {
-                return Err(format!(
-                    "Block {} out of range for layer {} ({} blocks registered)",
-                    block_idx, layer_name, registration.num_blocks
-                ));
-            }
 
             let key = (layer_name.to_string(), block_hash.clone());
             let Some(block) = self.kv_storage.get(&key) else {
                 return Err(format!("Missing KV block for layer {}", layer_name));
             };
 
-            let expected_size = registration
-                .bytes_per_block
-                .checked_mul(registration.segments)
-                .ok_or_else(|| "Stored block size overflow".to_string())?;
-            if block.size() != expected_size {
-                return Err(format!(
-                    "Stored block size mismatch for layer {}: {} vs {}",
-                    layer_name,
-                    block.size(),
-                    expected_size
-                ));
-            }
-
             blocks_to_load.push((block_idx, block));
         }
 
         let mut total_transfer = 0;
+        let stream = self.ensure_layer_stream(layer_name)?;
 
         // Optimize for layer-first layout with KV stride
         if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
@@ -505,19 +544,29 @@ impl PegaEngine {
             v_transfers.sort_by_key(|&(offset, _)| offset);
 
             // Batch copy K segments
-            self.batch_copy_segments_to_gpu(&k_transfers, segment_size, &registration)?;
+            self.batch_copy_segments_to_gpu(&k_transfers, segment_size, &registration, &stream)?;
 
             // Batch copy V segments
-            self.batch_copy_segments_to_gpu(&v_transfers, segment_size, &registration)?;
+            self.batch_copy_segments_to_gpu(&v_transfers, segment_size, &registration, &stream)?;
 
             total_transfer = blocks_to_load.len() * segment_size * 2;
         } else {
             // Original logic for contiguous or single-segment layouts
             for (block_idx, block) in blocks_to_load {
-                self.copy_block_cpu_to_gpu(&registration, block_idx, block.ptr() as *const u8)?;
+                self.copy_block_cpu_to_gpu(
+                    &registration,
+                    block_idx,
+                    block.ptr() as *const u8,
+                    &stream,
+                )?;
                 total_transfer += block.size();
             }
         }
+
+        let event = stream
+            .record_event(None)
+            .map_err(|e| format!("Failed to record CUDA event for {layer_name}: {e:?}"))?;
+        self.record_layer_event(layer_name, &stream, event);
 
         let end_time = Instant::now();
         // print cost
@@ -527,13 +576,33 @@ impl PegaEngine {
         } else {
             0.0
         };
-        info!(
+        debug!(
             total_transfer,
             elapsed_us = (end_time - start_time).as_micros(),
             bandwidth_gbps = bandwidth / 1e9,
             "Completed load_kv_blocks_to_ipc"
         );
         Ok(total_transfer)
+    }
+
+    /// Block until the most recent async transfer for a layer finishes.
+    pub fn wait_for_layer_transfer(&self, layer_name: &str) -> Result<(), String> {
+        let event = {
+            let mut guard = self
+                .layer_transfers
+                .lock()
+                .expect("layer transfer map poisoned");
+            guard
+                .get_mut(layer_name)
+                .and_then(|state| state.last_event.take())
+        };
+
+        if let Some(event) = event {
+            event
+                .synchronize()
+                .map_err(|e| format!("Failed to sync layer {layer_name}: {e:?}"))?;
+        }
+        Ok(())
     }
 
     /// Calculate the byte offset for a given block/segment combination.
@@ -573,14 +642,20 @@ impl PegaEngine {
         Ok(offset)
     }
 
-    /// Copy data from CPU to GPU
-    #[instrument(level = "debug", skip(self, cpu_buffer), fields(offset, size), err)]
-    fn copy_cpu_to_gpu(
+    /// Copy data from CPU to GPU asynchronously on the provided stream
+    #[instrument(
+        level = "debug",
+        skip(self, cpu_buffer, stream),
+        fields(offset, size),
+        err
+    )]
+    fn copy_cpu_to_gpu_async(
         &self,
         gpu_base_ptr: u64,
         offset: usize,
         cpu_buffer: &[u8],
         size: usize,
+        stream: &CudaStream,
     ) -> Result<(), String> {
         use cudarc::driver::sys;
 
@@ -596,10 +671,14 @@ impl PegaEngine {
         let src_ptr = cpu_buffer.as_ptr();
 
         unsafe {
-            // Use synchronous copy for simplicity
-            let result = sys::cuMemcpyHtoD_v2(dst_ptr, src_ptr as *const std::ffi::c_void, size);
+            let result = sys::cuMemcpyHtoDAsync_v2(
+                dst_ptr,
+                src_ptr as *const std::ffi::c_void,
+                size,
+                stream.cu_stream(),
+            );
             if result != sys::cudaError_enum::CUDA_SUCCESS {
-                return Err(format!("cuMemcpyHtoD failed: {:?}", result));
+                return Err(format!("cuMemcpyHtoDAsync failed: {:?}", result));
             }
         }
 
@@ -660,6 +739,7 @@ impl PegaEngine {
         transfers: &[(usize, *const u8)],
         segment_size: usize,
         registration: &KVCacheRegistration,
+        stream: &CudaStream,
     ) -> Result<(), String> {
         let total_segments = transfers.len();
         let mut batch_count = 0;
@@ -691,11 +771,12 @@ impl PegaEngine {
                     // Batch copy contiguous range
                     let total_size = count * segment_size;
                     let buffer = unsafe { std::slice::from_raw_parts(start_cpu_ptr, total_size) };
-                    self.copy_cpu_to_gpu(
+                    self.copy_cpu_to_gpu_async(
                         registration.data_ptr,
                         start_gpu_offset,
                         buffer,
                         total_size,
+                        stream,
                     )?;
                     batch_count += 1;
                     i += count;
@@ -705,11 +786,12 @@ impl PegaEngine {
 
             // Copy individual segment
             let buffer = unsafe { std::slice::from_raw_parts(start_cpu_ptr, segment_size) };
-            self.copy_cpu_to_gpu(
+            self.copy_cpu_to_gpu_async(
                 registration.data_ptr,
                 start_gpu_offset,
                 buffer,
                 segment_size,
+                stream,
             )?;
             batch_count += 1;
             i += 1;
@@ -757,14 +839,15 @@ impl PegaEngine {
         registration: &KVCacheRegistration,
         block_idx: usize,
         src_ptr: *const u8,
+        stream: &CudaStream,
     ) -> Result<(), String> {
         if Self::is_contiguous_layout(registration) {
             let block_size = self.block_size(registration)?;
             let offset = self.segment_offset(registration, block_idx, 0)?;
             let buffer = unsafe { std::slice::from_raw_parts(src_ptr, block_size) };
-            self.copy_cpu_to_gpu(registration.data_ptr, offset, buffer, block_size)
+            self.copy_cpu_to_gpu_async(registration.data_ptr, offset, buffer, block_size, stream)
         } else {
-            self.copy_cpu_to_gpu_strided(registration, block_idx, src_ptr)
+            self.copy_cpu_to_gpu_strided(registration, block_idx, src_ptr, stream)
         }
     }
 
@@ -798,6 +881,7 @@ impl PegaEngine {
         registration: &KVCacheRegistration,
         block_idx: usize,
         src_ptr: *const u8,
+        stream: &CudaStream,
     ) -> Result<(), String> {
         // Copy each segment separately using regular cuMemcpy
         for segment_idx in 0..registration.segments {
@@ -808,11 +892,12 @@ impl PegaEngine {
                 std::slice::from_raw_parts(src_segment_ptr, registration.bytes_per_block)
             };
 
-            self.copy_cpu_to_gpu(
+            self.copy_cpu_to_gpu_async(
                 registration.data_ptr,
                 dst_offset,
                 buffer,
                 registration.bytes_per_block,
+                stream,
             )?;
         }
         Ok(())
