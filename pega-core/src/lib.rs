@@ -48,24 +48,11 @@ pub struct PegaEngine {
     kv_storage: Cache<BlockKey, Arc<Block>>,
     /// Pinned memory pool for zero-copy GPU transfers
     pinned_pool: Arc<PinnedMemoryPool>,
-    /// Track per-layer transfer streams/events for async loading
-    layer_transfers: Mutex<HashMap<String, LayerTransferState>>,
-    // context
-    cuda_ctx: Arc<CudaContext>,
-}
-
-struct LayerTransferState {
+    /// Single stream for all transfers to ensure sequential execution (Layer0 -> Layer1...)
     stream: Arc<CudaStream>,
-    last_event: Option<CudaEvent>,
-}
-
-impl LayerTransferState {
-    fn new(stream: Arc<CudaStream>) -> Self {
-        Self {
-            stream,
-            last_event: None,
-        }
-    }
+    /// Track per-layer completion events for async loading
+    layer_events: Mutex<HashMap<String, CudaEvent>>,
+    _cuda_ctx: Arc<CudaContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,13 +171,15 @@ impl PegaEngine {
 
         // TODO: hard code device 0 for now
         let cuda_ctx = cudarc::driver::CudaContext::new(0).unwrap();
+        let stream = cuda_ctx.new_stream().expect("Failed to create stream");
 
         PegaEngine {
             kv_caches: HashMap::new(),
             kv_storage,
             pinned_pool,
-            layer_transfers: Mutex::new(HashMap::new()),
-            cuda_ctx: cuda_ctx,
+            stream: stream,
+            layer_events: Mutex::new(HashMap::new()),
+            _cuda_ctx: cuda_ctx,
         }
     }
 
@@ -248,46 +237,10 @@ impl PegaEngine {
         self.pinned_pool.usage()
     }
 
-    fn ensure_layer_stream(&self, layer_name: &str) -> Result<Arc<CudaStream>, String> {
-        let mut guard = self
-            .layer_transfers
-            .lock()
-            .expect("layer transfer map poisoned");
+    fn record_layer_event(&self, layer_name: &str, event: CudaEvent) {
+        let mut guard = self.layer_events.lock().expect("layer events map poisoned");
 
-        if let Some(state) = guard.get(layer_name) {
-            return Ok(state.stream.clone());
-        }
-
-        let stream = self
-            .cuda_ctx
-            .new_stream()
-            .map_err(|e| format!("Failed to create stream for {layer_name}: {e:?}"))?;
-        guard.insert(
-            layer_name.to_string(),
-            LayerTransferState::new(stream.clone()),
-        );
-        Ok(stream)
-    }
-
-    fn record_layer_event(&self, layer_name: &str, stream: &Arc<CudaStream>, event: CudaEvent) {
-        let mut guard = self
-            .layer_transfers
-            .lock()
-            .expect("layer transfer map poisoned");
-
-        if let Some(state) = guard.get_mut(layer_name) {
-            state.stream = stream.clone();
-            state.last_event = Some(event);
-            return;
-        }
-
-        guard.insert(
-            layer_name.to_string(),
-            LayerTransferState {
-                stream: stream.clone(),
-                last_event: Some(event),
-            },
-        );
+        guard.insert(layer_name.to_string(), event);
     }
 
     #[instrument(
@@ -553,7 +506,7 @@ impl PegaEngine {
         }
 
         let mut total_transfer = 0;
-        let stream = self.ensure_layer_stream(layer_name)?;
+        let stream = self.stream.clone();
 
         // Optimize for layer-first layout with KV stride
         if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
@@ -617,7 +570,7 @@ impl PegaEngine {
         let event = stream
             .record_event(None)
             .map_err(|e| format!("Failed to record CUDA event for {layer_name}: {e:?}"))?;
-        self.record_layer_event(layer_name, &stream, event);
+        self.record_layer_event(layer_name, event);
 
         let end_time = Instant::now();
         // print cost
@@ -639,13 +592,8 @@ impl PegaEngine {
     /// Block until the most recent async transfer for a layer finishes.
     pub fn wait_for_layer_transfer(&self, layer_name: &str) -> Result<(), String> {
         let event = {
-            let mut guard = self
-                .layer_transfers
-                .lock()
-                .expect("layer transfer map poisoned");
-            guard
-                .get_mut(layer_name)
-                .and_then(|state| state.last_event.take())
+            let mut guard = self.layer_events.lock().expect("layer events map poisoned");
+            guard.remove(layer_name)
         };
 
         if let Some(event) = event {
