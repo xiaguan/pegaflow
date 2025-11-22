@@ -162,7 +162,10 @@ impl PegaEngine {
     /// Batch load KV blocks for multiple layers using the same block mapping
     ///
     /// This is much more efficient than calling load_kv_blocks_to_ipc in a loop
-    /// from Python, as it avoids Python overhead and data copying.
+    /// from Python, as it avoids Python overhead, data copying, and redundant hash lookups.
+    ///
+    /// The optimization reduces hash table lookups from O(layers × blocks) to O(blocks)
+    /// by performing all lookups once and then extracting blocks for each layer.
     ///
     /// Args:
     ///     layer_names: List of layer names to load
@@ -176,25 +179,23 @@ impl PegaEngine {
         block_hashes: Vec<Vec<u8>>,
     ) -> PyResult<(usize, usize)> {
         py.allow_threads(|| {
-            let mut total_bytes = 0;
-            let mut total_layers = 0;
+            // Convert Vec<String> to Vec<&str> for the engine call
+            let layer_name_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
-            for layer_name in &layer_names {
-                match self
-                    .engine
-                    .load_kv_blocks_to_ipc(layer_name, &block_ids, &block_hashes)
-                {
-                    Ok(bytes) => {
-                        total_bytes += bytes;
-                        total_layers += 1;
-                    }
-                    Err(e) => {
-                        // Log error but continue with other layers
-                        println!("Failed to load layer {}: {}", layer_name, e);
-                    }
+            match self
+                .engine
+                .batch_load_kv_blocks_multi_layer(&layer_name_refs, &block_ids, &block_hashes)
+            {
+                Ok(results) => {
+                    let total_layers = results.len();
+                    let total_bytes = results.iter().map(|(_, bytes)| bytes).sum();
+                    Ok((total_layers, total_bytes))
                 }
+                Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "Failed to batch load KV blocks: {}",
+                    e
+                ))),
             }
-            Ok((total_layers, total_bytes))
         })
     }
 
