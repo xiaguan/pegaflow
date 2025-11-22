@@ -83,11 +83,6 @@ impl PegaEngine {
         })
     }
 
-    /// Get the number of registered KV caches
-    fn num_registered_kv_caches(&self) -> usize {
-        self.engine.num_registered_kv_caches()
-    }
-
     /// Save KV blocks from GPU via IPC handle to CPU memory
     ///
     /// Args:
@@ -105,12 +100,6 @@ impl PegaEngine {
             self.engine
                 .save_kv_blocks_from_ipc(layer_name, block_ids, block_hashes)
         })
-    }
-
-    /// Get storage statistics
-    /// Returns (num_blocks, total_bytes)
-    fn get_storage_stats(&self) -> (usize, usize) {
-        self.engine.get_storage_stats()
     }
 
     /// Check which KV blocks are available in CPU storage
@@ -131,26 +120,6 @@ impl PegaEngine {
             self.engine
                 .check_kv_blocks_availability(layer_name, block_hashes)
         })
-    }
-
-    /// Load KV blocks from CPU memory to GPU via IPC handle
-    ///
-    /// Args:
-    ///     layer_name: Name of the layer
-    ///     block_ids: GPU block IDs to load into (list of ints)
-    ///     block_hashes: Content hashes for each block (list of bytes)
-    fn load_kv_blocks_to_ipc(
-        &self,
-        py: Python<'_>,
-        layer_name: String,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
-    ) -> PyResult<usize> {
-        py.allow_threads(|| {
-            self.engine
-                .load_kv_blocks_to_ipc(&layer_name, &block_ids, &block_hashes)
-        })
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
     }
 
     /// Wait until the async transfer for `layer_name` completes.
@@ -182,10 +151,11 @@ impl PegaEngine {
             // Convert Vec<String> to Vec<&str> for the engine call
             let layer_name_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
 
-            match self
-                .engine
-                .batch_load_kv_blocks_multi_layer(&layer_name_refs, &block_ids, &block_hashes)
-            {
+            match self.engine.batch_load_kv_blocks_multi_layer(
+                &layer_name_refs,
+                &block_ids,
+                &block_hashes,
+            ) {
                 Ok(results) => {
                     let total_layers = results.len();
                     let total_bytes = results.iter().map(|(_, bytes)| bytes).sum();
@@ -197,12 +167,6 @@ impl PegaEngine {
                 ))),
             }
         })
-    }
-
-    /// Get pinned memory usage statistics
-    /// Returns (used_bytes, total_bytes)
-    fn get_pinned_memory_usage(&self) -> (usize, usize) {
-        self.engine.get_pinned_memory_usage()
     }
 }
 

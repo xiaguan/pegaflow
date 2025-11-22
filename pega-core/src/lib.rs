@@ -149,11 +149,6 @@ impl Block {
     fn size(&self) -> usize {
         self.size
     }
-
-    fn weight(&self) -> u32 {
-        u32::try_from(self.size)
-            .expect("KV block larger than u32::MAX bytes is not supported for caching")
-    }
 }
 
 // Safety: Block wraps read-only pinned allocations with RAII cleanup
@@ -171,6 +166,7 @@ impl PegaEngine {
     pub fn new_with_pool_size(pool_size: usize) -> Self {
         let pinned_pool = Arc::new(PinnedMemoryPool::new(pool_size));
         let cache_capacity = ((pool_size as f64) * CACHE_USAGE_RATIO).floor().max(1.0) as u64;
+        // TODO: handle weigher more gracefully
         let kv_storage = Cache::builder()
             .max_capacity(cache_capacity)
             .weigher(|_, layer_blocks_with_weight: &Arc<LayerBlocksWithWeight>| {
@@ -240,20 +236,9 @@ impl PegaEngine {
         self.kv_caches.clear();
     }
 
-    /// Get the number of registered KV caches
-    #[instrument(level = "debug", skip(self), ret)]
-    pub fn num_registered_kv_caches(&self) -> usize {
-        self.kv_caches.len()
-    }
-
     /// Allocate pinned memory from the pool. Returns RAII guard. Panics when the allocation cannot be satisfied.
     fn allocate_pinned(&self, size: usize) -> PinnedAllocation {
         self.pinned_pool.allocate(size)
-    }
-
-    /// Get pinned memory usage statistics
-    pub fn get_pinned_memory_usage(&self) -> (usize, usize) {
-        self.pinned_pool.usage()
     }
 
     /// Get the layer_id for a given layer_name
@@ -445,15 +430,6 @@ impl PegaEngine {
         }
     }
 
-    /// Get storage statistics
-    /// Returns (num_blocks, total_bytes)
-    #[instrument(level = "info", skip(self), ret)]
-    pub fn get_storage_stats(&self) -> (usize, usize) {
-        let num_blocks = usize::try_from(self.kv_storage.entry_count()).unwrap_or(usize::MAX);
-        let total_bytes = usize::try_from(self.kv_storage.weighted_size()).unwrap_or(usize::MAX);
-        (num_blocks, total_bytes)
-    }
-
     /// Check which KV blocks are available in CPU storage
     ///
     /// Args:
@@ -509,161 +485,6 @@ impl PegaEngine {
         );
 
         availability
-    }
-
-    /// Load KV blocks from CPU memory to GPU via IPC handle
-    ///
-    /// Args:
-    ///   - layer_name: Name of the layer
-    ///   - block_ids: GPU block IDs to load into
-    ///   - block_hashes: Content hashes for each block
-    #[instrument(
-        level = "debug",
-        skip(self, block_ids, block_hashes),
-        fields(layer = %layer_name, blocks = %block_ids.len(), hashes = %block_hashes.len()),
-        err
-    )]
-    pub fn load_kv_blocks_to_ipc(
-        &self,
-        layer_name: &str,
-        block_ids: &[i32],
-        block_hashes: &[Vec<u8>],
-    ) -> Result<usize, String> {
-        let start_time = Instant::now();
-
-        let layer_id = self
-            .get_layer_id(layer_name)
-            .ok_or_else(|| format!("Layer {} not registered", layer_name))?;
-
-        let registration = self
-            .kv_caches
-            .get(layer_name)
-            .ok_or_else(|| format!("Layer {} not registered", layer_name))?;
-
-        // Collect valid blocks to load
-        let mut blocks_to_load = Vec::with_capacity(block_ids.len());
-
-        for (block_id, block_hash) in block_ids.iter().zip(block_hashes.iter()) {
-            let block_idx = *block_id as usize;
-
-            let layer_blocks = self
-                .kv_storage
-                .get(block_hash)
-                .ok_or_else(|| format!("Missing KV block hash for layer {}", layer_name))?;
-
-            let blocks = layer_blocks.blocks.lock().unwrap();
-            let block = blocks
-                .get(layer_id)
-                .and_then(|opt| opt.as_ref())
-                .ok_or_else(|| {
-                    format!(
-                        "Missing KV block for layer {} at layer_id {}",
-                        layer_name, layer_id
-                    )
-                })?
-                .clone();
-
-            blocks_to_load.push((block_idx, block));
-        }
-
-        let end_time = Instant::now();
-        info!(
-            "load_kv_blocks_to_ipc: lookup time: {} us",
-            (end_time - start_time).as_micros()
-        );
-
-        let mut total_transfer = 0;
-        let stream = self.stream.clone();
-
-        // Optimize for layer-first layout with KV stride
-        if registration.segments == 2 && registration.kv_stride_bytes > registration.bytes_per_block
-        {
-            let segment_size = registration.bytes_per_block;
-
-            // Prepare K and V segments with their GPU destinations
-            let mut k_transfers = Vec::with_capacity(blocks_to_load.len());
-            let mut v_transfers = Vec::with_capacity(blocks_to_load.len());
-
-            for (block_idx, block) in &blocks_to_load {
-                let k_gpu_offset = transfer::segment_offset(&registration, *block_idx, 0)?;
-                let v_gpu_offset = transfer::segment_offset(&registration, *block_idx, 1)?;
-
-                // K segment is at k_ptr, V segment is at v_ptr
-                // In the new split layout, they are in separate memory regions provided by Block::new_split
-                // In the legacy or different layout, check logic. But for this branch (segments == 2 && stride > block),
-                // we assume it's the split layout we just optimized.
-                let k_cpu_ptr = block.k_ptr() as *const u8;
-
-                // Fallback for old blocks if any, or correct new blocks
-                // If v_ptr is None, it means it was stored as contiguous block (maybe old version data or different path block?)
-                // But if we are in this branch, we expect split handling.
-                // However, let's support "contiguous block loaded into split GPU layout" just in case?
-                // No, for now we assume data saved with new logic has v_ptr.
-                let v_cpu_ptr = if let Some(v_ptr) = block.v_ptr() {
-                    v_ptr as *const u8
-                } else {
-                    // If it was stored contiguously (e.g. old format), V follows K
-                    unsafe { k_cpu_ptr.add(segment_size) }
-                };
-
-                k_transfers.push((k_gpu_offset, k_cpu_ptr));
-                v_transfers.push((v_gpu_offset, v_cpu_ptr));
-            }
-
-            // Sort by GPU offset for batching
-            k_transfers.sort_by_key(|&(offset, _)| offset);
-            v_transfers.sort_by_key(|&(offset, _)| offset);
-
-            // Batch copy K segments
-            transfer::batch_copy_segments_to_gpu(
-                &k_transfers,
-                segment_size,
-                &registration,
-                &stream,
-            )?;
-
-            // Batch copy V segments
-            transfer::batch_copy_segments_to_gpu(
-                &v_transfers,
-                segment_size,
-                &registration,
-                &stream,
-            )?;
-
-            total_transfer = blocks_to_load.len() * segment_size * 2;
-        } else {
-            // Original logic for contiguous or single-segment layouts
-            for (block_idx, block) in blocks_to_load {
-                transfer::copy_block_cpu_to_gpu(
-                    &registration,
-                    block_idx,
-                    block.k_ptr() as *const u8,
-                    &stream,
-                )?;
-                total_transfer += block.size();
-            }
-        }
-
-        let event = stream
-            .record_event(None)
-            .map_err(|e| format!("Failed to record CUDA event for {layer_name}: {e:?}"))?;
-        self.record_layer_event(layer_name, event);
-
-        let end_time = Instant::now();
-        // print cost
-        let elapsed = (end_time - start_time).as_secs_f64();
-        let bandwidth = if elapsed > 0.0 {
-            total_transfer as f64 / elapsed
-        } else {
-            0.0
-        };
-        debug!(
-            total_transfer,
-            elapsed_us = (end_time - start_time).as_micros(),
-            bandwidth_gbps = bandwidth / 1e9,
-            "Completed load_kv_blocks_to_ipc"
-        );
-        Ok(total_transfer)
     }
 
     /// Batch load KV blocks for multiple layers with shared block mapping

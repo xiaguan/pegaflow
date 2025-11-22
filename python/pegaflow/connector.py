@@ -465,15 +465,9 @@ class PegaKVConnector(KVConnectorBase_V1):
             into account.
         """
         prompt_token_ids = request.prompt_token_ids or []
-        if len(prompt_token_ids) == 0:
-            return (0, False)
-
         req_id = request.request_id
         num_tokens = len(prompt_token_ids)
-
-        block_hashes = list(getattr(request, "block_hashes", []) or [])
-        if len(block_hashes) == 0:
-            return (0, False)
+        block_hashes = request.block_hashes
 
         matched_blocks = self._send_lookup_request(req_id, block_hashes)
         if matched_blocks <= 0:
