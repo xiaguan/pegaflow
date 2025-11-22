@@ -1,5 +1,6 @@
 pub mod allocator;
 pub mod pinned_pool;
+mod transfer;
 
 // ============================================================================
 // PegaEngine currently prioritizes vLLM's layer-first (KV-first) tensor layout.
@@ -300,7 +301,7 @@ impl PegaEngine {
             return;
         }
 
-        let block_size = self.block_size(&registration).unwrap();
+        let block_size = transfer::block_size(&registration).unwrap();
         let num_blocks = blocks_to_save.len();
 
         // For layer-first layout with KV stride, allocate separate regions for K and V
@@ -321,8 +322,8 @@ impl PegaEngine {
             let mut v_offsets_with_idx = Vec::with_capacity(num_blocks);
 
             for (i, (block_idx, _)) in blocks_to_save.iter().enumerate() {
-                let k_offset = self.segment_offset(&registration, *block_idx, 0).unwrap();
-                let v_offset = self.segment_offset(&registration, *block_idx, 1).unwrap();
+                let k_offset = transfer::segment_offset(&registration, *block_idx, 0).unwrap();
+                let v_offset = transfer::segment_offset(&registration, *block_idx, 1).unwrap();
                 k_offsets_with_idx.push((k_offset, i));
                 v_offsets_with_idx.push((v_offset, i));
             }
@@ -332,12 +333,22 @@ impl PegaEngine {
             v_offsets_with_idx.sort_by_key(|&(offset, _)| offset);
 
             // Batch copy K segments
-            self.batch_copy_segments(&k_offsets_with_idx, k_base_ptr, segment_size, &registration)
-                .unwrap();
+            transfer::batch_copy_segments(
+                &k_offsets_with_idx,
+                k_base_ptr,
+                segment_size,
+                &registration,
+            )
+            .unwrap();
 
             // Batch copy V segments
-            self.batch_copy_segments(&v_offsets_with_idx, v_base_ptr, segment_size, &registration)
-                .unwrap();
+            transfer::batch_copy_segments(
+                &v_offsets_with_idx,
+                v_base_ptr,
+                segment_size,
+                &registration,
+            )
+            .unwrap();
 
             // Create Block objects after all copying is done
             for (i, (_, key)) in blocks_to_save.into_iter().enumerate() {
@@ -365,8 +376,7 @@ impl PegaEngine {
             // Copy blocks and create Block objects
             for (i, (block_idx, key)) in blocks_to_save.into_iter().enumerate() {
                 let cpu_ptr = unsafe { base_ptr.add(i * block_size) };
-                self.copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr)
-                    .unwrap();
+                transfer::copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr).unwrap();
 
                 let block = Arc::new(Block::new_contiguous(
                     cpu_ptr,
@@ -379,31 +389,6 @@ impl PegaEngine {
         }
     }
 
-    /// Copy data from GPU to CPU
-    #[instrument(level = "debug", skip(self, cpu_buffer), fields(offset, size), err)]
-    fn copy_gpu_to_cpu(
-        &self,
-        gpu_base_ptr: u64,
-        offset: usize,
-        cpu_buffer: &mut [u8],
-        size: usize,
-    ) -> Result<(), String> {
-        use cudarc::driver::sys;
-
-        let src_ptr = gpu_base_ptr + offset as u64;
-        let dst_ptr = cpu_buffer.as_mut_ptr();
-
-        unsafe {
-            // Use synchronous copy for simplicity
-            let result = sys::cuMemcpyDtoH_v2(dst_ptr as *mut std::ffi::c_void, src_ptr, size);
-            if result != sys::cudaError_enum::CUDA_SUCCESS {
-                return Err(format!("cuMemcpyDtoH failed: {:?}", result));
-            }
-        }
-
-        Ok(())
-    }
-
     /// Get storage statistics
     /// Returns (num_blocks, total_bytes)
     #[instrument(level = "info", skip(self), ret)]
@@ -411,28 +396,6 @@ impl PegaEngine {
         let num_blocks = usize::try_from(self.kv_storage.entry_count()).unwrap_or(usize::MAX);
         let total_bytes = usize::try_from(self.kv_storage.weighted_size()).unwrap_or(usize::MAX);
         (num_blocks, total_bytes)
-    }
-
-    /// Remove a KV block and free its memory
-    #[instrument(level = "info", skip(self, block_hash), fields(layer = %layer_name))]
-    pub fn remove_kv_block(&mut self, layer_name: String, block_hash: Vec<u8>) -> bool {
-        let mut key_buffer = Vec::new();
-        Self::encode_key_to_buffer(&layer_name, &block_hash, &mut key_buffer);
-
-        if self.kv_storage.contains_key(key_buffer.as_slice()) {
-            self.kv_storage.invalidate(key_buffer.as_slice());
-            self.kv_storage.run_pending_tasks();
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Clear all stored KV blocks and free their memory
-    #[instrument(level = "info", skip(self))]
-    pub fn clear_all_kv_blocks(&mut self) {
-        self.kv_storage.invalidate_all();
-        self.kv_storage.run_pending_tasks();
     }
 
     /// Check which KV blocks are available in CPU storage
@@ -539,8 +502,8 @@ impl PegaEngine {
             let mut v_transfers = Vec::with_capacity(blocks_to_load.len());
 
             for (block_idx, block) in &blocks_to_load {
-                let k_gpu_offset = self.segment_offset(&registration, *block_idx, 0)?;
-                let v_gpu_offset = self.segment_offset(&registration, *block_idx, 1)?;
+                let k_gpu_offset = transfer::segment_offset(&registration, *block_idx, 0)?;
+                let v_gpu_offset = transfer::segment_offset(&registration, *block_idx, 1)?;
 
                 // K segment is at k_ptr, V segment is at v_ptr
                 // In the new split layout, they are in separate memory regions provided by Block::new_split
@@ -569,16 +532,26 @@ impl PegaEngine {
             v_transfers.sort_by_key(|&(offset, _)| offset);
 
             // Batch copy K segments
-            self.batch_copy_segments_to_gpu(&k_transfers, segment_size, &registration, &stream)?;
+            transfer::batch_copy_segments_to_gpu(
+                &k_transfers,
+                segment_size,
+                &registration,
+                &stream,
+            )?;
 
             // Batch copy V segments
-            self.batch_copy_segments_to_gpu(&v_transfers, segment_size, &registration, &stream)?;
+            transfer::batch_copy_segments_to_gpu(
+                &v_transfers,
+                segment_size,
+                &registration,
+                &stream,
+            )?;
 
             total_transfer = blocks_to_load.len() * segment_size * 2;
         } else {
             // Original logic for contiguous or single-segment layouts
             for (block_idx, block) in blocks_to_load {
-                self.copy_block_cpu_to_gpu(
+                transfer::copy_block_cpu_to_gpu(
                     &registration,
                     block_idx,
                     block.k_ptr() as *const u8,
@@ -624,291 +597,6 @@ impl PegaEngine {
         }
         Ok(())
     }
-
-    /// Calculate the byte offset for a given block/segment combination.
-    fn segment_offset(
-        &self,
-        registration: &KVCacheRegistration,
-        block_idx: usize,
-        segment_idx: usize,
-    ) -> Result<usize, String> {
-        if segment_idx >= registration.segments {
-            return Err("Segment index out of range".to_string());
-        }
-
-        let base = block_idx
-            .checked_mul(registration.bytes_per_block)
-            .ok_or_else(|| "Block offset overflow".to_string())?;
-
-        let segment_offset = segment_idx
-            .checked_mul(registration.kv_stride_bytes)
-            .ok_or_else(|| "Segment offset overflow".to_string())?;
-
-        let offset = base
-            .checked_add(segment_offset)
-            .ok_or_else(|| "Combined offset overflow".to_string())?;
-
-        if offset + registration.bytes_per_block > registration.size_bytes {
-            return Err(format!(
-                "Block {} segment {} exceeds registered memory (offset {}, size {}, limit {})",
-                block_idx,
-                segment_idx,
-                offset,
-                registration.bytes_per_block,
-                registration.size_bytes
-            ));
-        }
-
-        Ok(offset)
-    }
-
-    /// Copy data from CPU to GPU asynchronously on the provided stream
-    #[instrument(
-        level = "debug",
-        skip(self, cpu_buffer, stream),
-        fields(offset, size),
-        err
-    )]
-    fn copy_cpu_to_gpu_async(
-        &self,
-        gpu_base_ptr: u64,
-        offset: usize,
-        cpu_buffer: &[u8],
-        size: usize,
-        stream: &CudaStream,
-    ) -> Result<(), String> {
-        use cudarc::driver::sys;
-
-        if cpu_buffer.len() < size {
-            return Err(format!(
-                "CPU buffer too small: {} bytes, need {} bytes",
-                cpu_buffer.len(),
-                size
-            ));
-        }
-
-        let dst_ptr = gpu_base_ptr + offset as u64;
-        let src_ptr = cpu_buffer.as_ptr();
-
-        unsafe {
-            let result = sys::cuMemcpyHtoDAsync_v2(
-                dst_ptr,
-                src_ptr as *const std::ffi::c_void,
-                size,
-                stream.cu_stream(),
-            );
-            if result != sys::cudaError_enum::CUDA_SUCCESS {
-                return Err(format!("cuMemcpyHtoDAsync failed: {:?}", result));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Batch copy segments by finding and merging contiguous ranges
-    fn batch_copy_segments(
-        &self,
-        offsets_with_idx: &[(usize, usize)],
-        base_ptr: *mut u8,
-        segment_size: usize,
-        registration: &KVCacheRegistration,
-    ) -> Result<(), String> {
-        let total_segments = offsets_with_idx.len();
-        let mut batch_count = 0;
-        let mut i = 0;
-
-        while i < offsets_with_idx.len() {
-            let (start_offset, start_idx) = offsets_with_idx[i];
-            let mut _end_idx = start_idx;
-            let mut count = 1;
-
-            // Find contiguous range
-            for j in i + 1..offsets_with_idx.len() {
-                let (offset, idx) = offsets_with_idx[j];
-                if offset == start_offset + count * segment_size {
-                    _end_idx = idx;
-                    count += 1;
-                } else {
-                    break;
-                }
-            }
-
-            // Perform batch copy for this contiguous range
-            let total_size = count * segment_size;
-            let cpu_ptr = unsafe { base_ptr.add(start_idx * segment_size) };
-            let buffer = unsafe { std::slice::from_raw_parts_mut(cpu_ptr, total_size) };
-            self.copy_gpu_to_cpu(registration.data_ptr, start_offset, buffer, total_size)?;
-
-            batch_count += 1;
-            i += count;
-        }
-
-        debug!(
-            "GPU->CPU batch copy: {} segments -> {} batches ({}x reduction)",
-            total_segments,
-            batch_count,
-            total_segments as f32 / batch_count as f32
-        );
-
-        Ok(())
-    }
-
-    /// Batch copy segments from CPU to GPU by finding and merging contiguous ranges
-    fn batch_copy_segments_to_gpu(
-        &self,
-        transfers: &[(usize, *const u8)],
-        segment_size: usize,
-        registration: &KVCacheRegistration,
-        stream: &CudaStream,
-    ) -> Result<(), String> {
-        let total_segments = transfers.len();
-        if total_segments == 0 {
-            info!("CPU->GPU batch copy: 0 segments -> 0 batches");
-            return Ok(());
-        }
-
-        let mut batch_count = 0;
-        let mut i = 0;
-
-        while i < total_segments {
-            let (start_gpu_offset, start_cpu_ptr) = transfers[i];
-            let mut count = 1;
-
-            while i + count < total_segments {
-                let (next_gpu_offset, next_cpu_ptr) = transfers[i + count];
-
-                let expected_gpu_offset = start_gpu_offset + count * segment_size;
-                let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
-
-                if next_gpu_offset == expected_gpu_offset && next_cpu_ptr == expected_cpu_ptr {
-                    count += 1;
-                } else {
-                    break;
-                }
-            }
-
-            let total_size = segment_size
-                .checked_mul(count)
-                .ok_or_else(|| "batch_copy_segments_to_gpu: total_size overflow".to_string())?;
-
-            let buffer = unsafe { std::slice::from_raw_parts(start_cpu_ptr, total_size) };
-            self.copy_cpu_to_gpu_async(
-                registration.data_ptr,
-                start_gpu_offset,
-                buffer,
-                total_size,
-                stream,
-            )?;
-
-            batch_count += 1;
-            i += count;
-        }
-
-        debug!(
-            "CPU->GPU batch copy: {} segments -> {} batches ({}x reduction)",
-            total_segments,
-            batch_count,
-            total_segments as f32 / batch_count as f32
-        );
-
-        Ok(())
-    }
-
-    fn block_size(&self, registration: &KVCacheRegistration) -> Result<usize, String> {
-        registration
-            .bytes_per_block
-            .checked_mul(registration.segments)
-            .ok_or_else(|| "Block size overflow".to_string())
-    }
-
-    fn is_contiguous_layout(registration: &KVCacheRegistration) -> bool {
-        registration.segments <= 1 || registration.kv_stride_bytes == registration.bytes_per_block
-    }
-
-    fn copy_block_gpu_to_cpu(
-        &self,
-        registration: &KVCacheRegistration,
-        block_idx: usize,
-        dst_ptr: *mut u8,
-    ) -> Result<(), String> {
-        if Self::is_contiguous_layout(registration) {
-            let block_size = self.block_size(registration)?;
-            let offset = self.segment_offset(registration, block_idx, 0)?;
-            let buffer = unsafe { std::slice::from_raw_parts_mut(dst_ptr, block_size) };
-            self.copy_gpu_to_cpu(registration.data_ptr, offset, buffer, block_size)
-        } else {
-            self.copy_gpu_to_cpu_strided(registration, block_idx, dst_ptr)
-        }
-    }
-
-    fn copy_block_cpu_to_gpu(
-        &self,
-        registration: &KVCacheRegistration,
-        block_idx: usize,
-        src_ptr: *const u8,
-        stream: &CudaStream,
-    ) -> Result<(), String> {
-        if Self::is_contiguous_layout(registration) {
-            let block_size = self.block_size(registration)?;
-            let offset = self.segment_offset(registration, block_idx, 0)?;
-            let buffer = unsafe { std::slice::from_raw_parts(src_ptr, block_size) };
-            self.copy_cpu_to_gpu_async(registration.data_ptr, offset, buffer, block_size, stream)
-        } else {
-            self.copy_cpu_to_gpu_strided(registration, block_idx, src_ptr, stream)
-        }
-    }
-
-    fn copy_gpu_to_cpu_strided(
-        &self,
-        registration: &KVCacheRegistration,
-        block_idx: usize,
-        dst_ptr: *mut u8,
-    ) -> Result<(), String> {
-        // Copy each segment separately using regular cuMemcpy
-        for segment_idx in 0..registration.segments {
-            let src_offset = self.segment_offset(registration, block_idx, segment_idx)?;
-            let dst_offset = segment_idx * registration.bytes_per_block;
-            let dst_segment_ptr = unsafe { dst_ptr.add(dst_offset) };
-            let buffer = unsafe {
-                std::slice::from_raw_parts_mut(dst_segment_ptr, registration.bytes_per_block)
-            };
-
-            self.copy_gpu_to_cpu(
-                registration.data_ptr,
-                src_offset,
-                buffer,
-                registration.bytes_per_block,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn copy_cpu_to_gpu_strided(
-        &self,
-        registration: &KVCacheRegistration,
-        block_idx: usize,
-        src_ptr: *const u8,
-        stream: &CudaStream,
-    ) -> Result<(), String> {
-        // Copy each segment separately using regular cuMemcpy
-        for segment_idx in 0..registration.segments {
-            let dst_offset = self.segment_offset(registration, block_idx, segment_idx)?;
-            let src_offset = segment_idx * registration.bytes_per_block;
-            let src_segment_ptr = unsafe { src_ptr.add(src_offset) };
-            let buffer = unsafe {
-                std::slice::from_raw_parts(src_segment_ptr, registration.bytes_per_block)
-            };
-
-            self.copy_cpu_to_gpu_async(
-                registration.data_ptr,
-                dst_offset,
-                buffer,
-                registration.bytes_per_block,
-                stream,
-            )?;
-        }
-        Ok(())
-    }
 }
 
 impl Default for PegaEngine {
@@ -922,62 +610,3 @@ impl Default for PegaEngine {
 // - CUDA context is thread-safe (Arc<CudaContext>)
 unsafe impl Send for PegaEngine {}
 unsafe impl Sync for PegaEngine {}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_cudarc_basic() {
-        // Get a stream for GPU 0
-        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
-        let stream = ctx.default_stream();
-
-        // copy a rust slice to the device
-        let _inp = stream.clone_htod(&[1.0f32; 100]).unwrap();
-
-        // or allocate directly
-        let _out = stream.alloc_zeros::<f32>(100).unwrap();
-    }
-
-    #[test]
-    fn test_gpu_to_cpu_copy() {
-        // 1. Create context and stream
-        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
-        let stream = ctx.default_stream();
-
-        // 2. Allocate and initialize data on GPU
-        let test_data = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
-        let gpu_data = stream.clone_htod(&test_data).unwrap();
-
-        // 3. Copy from GPU to CPU
-        let cpu_data: Vec<f32> = stream.clone_dtoh(&gpu_data).unwrap();
-
-        // 4. Verify the data
-        assert_eq!(cpu_data, test_data);
-        println!("GPU->CPU copy test passed! Data: {:?}", cpu_data);
-    }
-
-    #[test]
-    fn test_gpu_to_cpu_copy_bf16() {
-        // 1. Create context and stream
-        let ctx = cudarc::driver::CudaContext::new(0).unwrap();
-        let stream = ctx.default_stream();
-
-        // 2. Simulate KV cache block: [2, 16, 12, 64] * bf16 (2 bytes)
-        let block_size = 2 * 16 * 12 * 64;
-        let test_data: Vec<u8> = (0..block_size).map(|i| (i % 256) as u8).collect();
-
-        // 3. Copy to GPU
-        let gpu_block = stream.clone_htod(&test_data).unwrap();
-
-        // 4. Copy back to CPU
-        let cpu_block: Vec<u8> = stream.clone_dtoh(&gpu_block).unwrap();
-
-        // 5. Verify
-        assert_eq!(cpu_block.len(), block_size);
-        assert_eq!(cpu_block, test_data);
-        println!(
-            "GPU->CPU BF16 block copy test passed! Block size: {} bytes",
-            block_size
-        );
-    }
-}
