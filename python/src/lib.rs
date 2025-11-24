@@ -42,7 +42,7 @@ impl PegaEngine {
         }
     }
 
-    /// Register a KV cache buffer along with its layout metadata.
+    /// Register a context layer buffer along with its layout metadata.
     ///
     /// Args:
     ///     layer_name: Name of the layer
@@ -52,7 +52,7 @@ impl PegaEngine {
     ///     bytes_per_block: Size of each paged block in bytes
     ///     kv_stride_bytes: Byte stride between K and V when KV-first layout is used
     ///     segments: Number of segments per block (1 for blocks-first, 2 for KV-first)
-    fn register_kv_cache(
+    fn register_context_layer(
         &self,
         py: Python<'_>,
         layer_name: String,
@@ -64,7 +64,7 @@ impl PegaEngine {
         segments: usize,
     ) {
         py.allow_threads(|| {
-            self.engine.register_kv_cache(
+            self.engine.register_context_layer(
                 layer_name,
                 data_ptr,
                 size_bytes,
@@ -76,10 +76,10 @@ impl PegaEngine {
         })
     }
 
-    /// Unregister all KV cache handles
-    fn unregister_all_kv_caches(&self, py: Python<'_>) {
+    /// Unregister the active inference context
+    fn unregister_context(&self, py: Python<'_>) {
         py.allow_threads(|| {
-            self.engine.unregister_all_kv_caches();
+            self.engine.unregister_context();
         })
     }
 

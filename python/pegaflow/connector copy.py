@@ -815,7 +815,7 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._lookup_context = None
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        """Register KV cache tensors with the PegaEngine via IPC.
+        """Register the active inference context with the engine service.
 
         Args:
             kv_caches: Dictionary mapping layer names to KV cache tensors
@@ -866,7 +866,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             # Send to engine server for registration
             try:
-                self._send_engine_request('REGISTER', {
+                self._send_engine_request('REGISTER_CONTEXT', {
                     'layer_name': layer_name,
                     'wrapper_bytes': wrapper_bytes,
                     'num_blocks': num_blocks,
@@ -885,8 +885,25 @@ class PegaKVConnector(KVConnectorBase_V1):
             layout if kv_caches else "unknown",
         )
 
+    def unregister_context(self) -> None:
+        """Unregister the active inference context from the engine server."""
+        if not self._registered_layers:
+            return
+
+        try:
+            self._send_engine_request('UNREGISTER_CONTEXT', {})
+        except Exception as exc:
+            logger.debug(
+                "[PegaKVConnector] Failed to unregister context: %s",
+                exc,
+                exc_info=True,
+            )
+        finally:
+            self._registered_layers.clear()
+
     def shutdown(self):
         """Shutdown the connector and unregister all KV caches."""
+        self.unregister_context()
         self._stop_lookup_server()
 
         # Shutdown engine connection

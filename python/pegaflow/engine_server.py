@@ -23,10 +23,11 @@ Protocol:
     Response: (status: str, result: Any)
 
 Commands:
-    - REGISTER: Register KV cache layer from IPC handle
+    - REGISTER_CONTEXT: Register KV cache layer from IPC handle
     - SAVE: Save blocks to CPU storage
     - LOAD: Load blocks to GPU
     - QUERY: Query cache hit count
+    - UNREGISTER_CONTEXT: Clear registered context and release tensors
     - SHUTDOWN: Clean shutdown
 """
 
@@ -122,8 +123,8 @@ class PegaEngineServer:
 
         self.running = False
 
-    def _handle_register(self, payload: dict) -> dict:
-        """Handle REGISTER command - register KV cache from IPC handle.
+    def _handle_register_context(self, payload: dict) -> dict:
+        """Handle REGISTER_CONTEXT command - register KV cache from IPC handle.
 
         Args:
             payload: {
@@ -157,7 +158,7 @@ class PegaEngineServer:
             data_ptr = tensor.data_ptr()
             size_bytes = tensor.untyped_storage().nbytes()
 
-            self.engine.register_kv_cache(
+            self.engine.register_context_layer(
                 layer_name,
                 data_ptr,
                 size_bytes,
@@ -175,7 +176,18 @@ class PegaEngineServer:
             return {'status': 'success'}
 
         except Exception as e:
-            logger.error("Failed to register KV cache: %s", e, exc_info=True)
+            logger.error("Failed to register context layer: %s", e, exc_info=True)
+            return {'status': 'error', 'message': str(e)}
+
+    def _handle_unregister_context(self) -> dict:
+        """Handle UNREGISTER_CONTEXT command - clear registered context."""
+        try:
+            self.engine.unregister_context()
+            self._tensors.clear()
+            logger.info("Unregistered active inference context")
+            return {'status': 'success'}
+        except Exception as e:
+            logger.error("Failed to unregister context: %s", e, exc_info=True)
             return {'status': 'error', 'message': str(e)}
 
     def _handle_save(self, payload: dict) -> dict:
@@ -326,8 +338,10 @@ class PegaEngineServer:
                 payload = msgpack.unpackb(message_parts[1], raw=False)
 
                 # Dispatch command
-                if command == 'REGISTER':
-                    response = self._handle_register(payload)
+                if command in ('REGISTER', 'REGISTER_CONTEXT'):
+                    response = self._handle_register_context(payload)
+                elif command in ('UNREGISTER', 'UNREGISTER_CONTEXT'):
+                    response = self._handle_unregister_context()
                 elif command == 'SAVE':
                     response = self._handle_save(payload)
                 elif command == 'LOAD':
@@ -371,9 +385,9 @@ class PegaEngineServer:
 
         # Unregister all KV caches
         try:
-            self.engine.unregister_all_kv_caches()
+            self.engine.unregister_context()
         except Exception as e:
-            logger.error("Error unregistering KV caches: %s", e)
+            logger.error("Error unregistering context: %s", e)
 
         # Clear tensor references
         self._tensors.clear()

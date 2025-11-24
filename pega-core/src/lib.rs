@@ -40,22 +40,10 @@ use crate::storage::{Block, StorageEngine};
 const DEFAULT_PINNED_POOL_BYTES: usize = 20 * 1024 * 1024 * 1024; // 10GB
 
 pub struct PegaEngine {
-    /// Store registered KV cache pointers (new IPC wrapper): layer_name -> registration
-    /// Wrapped in RwLock for thread-safe registration with concurrent reads
-    kv_caches: RwLock<HashMap<String, KVCacheRegistration>>,
-    /// Map layer names to layer IDs for efficient indexing
-    /// Wrapped in RwLock for thread-safe registration with concurrent reads
-    layer_name_to_id: RwLock<HashMap<String, usize>>,
-    /// Ordered list of layer names (layer_id is the index into this vec)
-    /// Wrapped in RwLock for thread-safe registration with concurrent reads
-    layer_names: RwLock<Vec<String>>,
+    /// Stateful context describing the active inference graph
+    context: EngineContext,
     /// Storage engine responsible for pinned allocations + block cache
     storage: StorageEngine,
-    /// Single stream for all transfers to ensure sequential execution (Layer0 -> Layer1...)
-    stream: Arc<CudaStream>,
-    /// Track per-layer completion events for async loading
-    layer_events: Mutex<HashMap<String, CudaEvent>>,
-    _cuda_ctx: Arc<CudaContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +59,103 @@ pub struct KVCacheRegistration {
     pub segments: usize,
 }
 
+struct EngineContext {
+    /// Store registered KV cache pointers (new IPC wrapper): layer_name -> registration
+    kv_caches: RwLock<HashMap<String, KVCacheRegistration>>,
+    /// Map layer names to layer IDs for efficient indexing
+    layer_name_to_id: RwLock<HashMap<String, usize>>,
+    /// Ordered list of layer names (layer_id is the index into this vec)
+    layer_names: RwLock<Vec<String>>,
+    /// Single stream for all transfers to ensure sequential execution (Layer0 -> Layer1...)
+    stream: Arc<CudaStream>,
+    /// Track per-layer completion events for async loading
+    layer_events: Mutex<HashMap<String, CudaEvent>>,
+    /// Hold CUDA context for the lifetime of the inference context
+    _cuda_ctx: Arc<CudaContext>,
+}
+
+impl EngineContext {
+    fn new(cuda_ctx: Arc<CudaContext>) -> Self {
+        let stream = cuda_ctx
+            .new_stream()
+            .expect("Failed to create stream for engine context");
+        Self {
+            kv_caches: RwLock::new(HashMap::new()),
+            layer_name_to_id: RwLock::new(HashMap::new()),
+            layer_names: RwLock::new(Vec::new()),
+            stream,
+            layer_events: Mutex::new(HashMap::new()),
+            _cuda_ctx: cuda_ctx,
+        }
+    }
+
+    fn register_layer(&self, layer_name: String, registration: KVCacheRegistration) {
+        let mut layer_name_to_id = self
+            .layer_name_to_id
+            .write()
+            .expect("layer_name_to_id lock poisoned");
+        let mut layer_names = self.layer_names.write().expect("layer_names lock poisoned");
+        let mut kv_caches = self.kv_caches.write().expect("kv_caches lock poisoned");
+
+        if !layer_name_to_id.contains_key(&layer_name) {
+            let layer_id = layer_names.len();
+            layer_name_to_id.insert(layer_name.clone(), layer_id);
+            layer_names.push(layer_name.clone());
+        }
+
+        kv_caches.insert(layer_name, registration);
+    }
+
+    fn clear(&self) {
+        let mut kv_caches = self.kv_caches.write().expect("kv_caches lock poisoned");
+        let mut layer_name_to_id = self
+            .layer_name_to_id
+            .write()
+            .expect("layer_name_to_id lock poisoned");
+        let mut layer_names = self.layer_names.write().expect("layer_names lock poisoned");
+
+        kv_caches.clear();
+        layer_name_to_id.clear();
+        layer_names.clear();
+        self.layer_events
+            .lock()
+            .expect("layer events map poisoned")
+            .clear();
+    }
+
+    fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
+        let map = self
+            .layer_name_to_id
+            .read()
+            .expect("layer_name_to_id lock poisoned");
+        map.get(layer_name).copied()
+    }
+
+    fn num_layers(&self) -> usize {
+        let names = self.layer_names.read().expect("layer_names lock poisoned");
+        names.len()
+    }
+
+    fn get_registration(&self, layer_name: &str) -> Option<KVCacheRegistration> {
+        let kv_caches = self.kv_caches.read().expect("kv_caches lock poisoned");
+        kv_caches.get(layer_name).cloned()
+    }
+
+    fn stream(&self) -> Arc<CudaStream> {
+        self.stream.clone()
+    }
+
+    fn record_layer_event(&self, layer_name: &str, event: CudaEvent) {
+        let mut guard = self.layer_events.lock().expect("layer events map poisoned");
+        guard.insert(layer_name.to_string(), event);
+    }
+
+    fn take_layer_event(&self, layer_name: &str) -> Option<CudaEvent> {
+        let mut guard = self.layer_events.lock().expect("layer events map poisoned");
+        guard.remove(layer_name)
+    }
+}
+
 impl PegaEngine {
     /// Create a new PegaEngine instance
     #[instrument(level = "info")]
@@ -83,17 +168,9 @@ impl PegaEngine {
         let storage = StorageEngine::new(pool_size);
         // TODO: hard code device 0 for now
         let cuda_ctx = cudarc::driver::CudaContext::new(0).unwrap();
-        let stream = cuda_ctx.new_stream().expect("Failed to create stream");
+        let context = EngineContext::new(cuda_ctx);
 
-        PegaEngine {
-            kv_caches: RwLock::new(HashMap::new()),
-            layer_name_to_id: RwLock::new(HashMap::new()),
-            layer_names: RwLock::new(Vec::new()),
-            storage,
-            stream,
-            layer_events: Mutex::new(HashMap::new()),
-            _cuda_ctx: cuda_ctx,
-        }
+        PegaEngine { context, storage }
     }
 
     /// Register a KV cache region with its layout info
@@ -102,7 +179,7 @@ impl PegaEngine {
         skip(self),
         fields(layer = %layer_name, size_bytes, num_blocks, bytes_per_block)
     )]
-    pub fn register_kv_cache(
+    pub fn register_context_layer(
         &self,
         layer_name: String,
         data_ptr: u64,
@@ -125,60 +202,27 @@ impl PegaEngine {
             segments,
         };
 
-        // Acquire write locks for registration
-        let mut layer_name_to_id = self
-            .layer_name_to_id
-            .write()
-            .expect("layer_name_to_id lock poisoned");
-        let mut layer_names = self.layer_names.write().expect("layer_names lock poisoned");
-        let mut kv_caches = self.kv_caches.write().expect("kv_caches lock poisoned");
-
-        // Assign layer_id if this is a new layer
-        if !layer_name_to_id.contains_key(&layer_name) {
-            let layer_id = layer_names.len();
-            layer_name_to_id.insert(layer_name.clone(), layer_id);
-            layer_names.push(layer_name.clone());
-        }
-
-        kv_caches.insert(layer_name, registration);
+        self.context.register_layer(layer_name, registration);
     }
 
     /// Unregister all KV cache handles
     #[instrument(level = "info", skip(self))]
-    pub fn unregister_all_kv_caches(&self) {
-        // Acquire write locks for all registration metadata
-        let mut kv_caches = self.kv_caches.write().expect("kv_caches lock poisoned");
-        let mut layer_name_to_id = self
-            .layer_name_to_id
-            .write()
-            .expect("layer_name_to_id lock poisoned");
-        let mut layer_names = self.layer_names.write().expect("layer_names lock poisoned");
-
-        // Clear all registration metadata
-        kv_caches.clear();
-        layer_name_to_id.clear();
-        layer_names.clear();
+    pub fn unregister_context(&self) {
+        self.context.clear();
     }
 
     /// Get the layer_id for a given layer_name
     fn get_layer_id(&self, layer_name: &str) -> Option<usize> {
-        let layer_name_to_id = self
-            .layer_name_to_id
-            .read()
-            .expect("layer_name_to_id lock poisoned");
-        layer_name_to_id.get(layer_name).copied()
+        self.context.get_layer_id(layer_name)
     }
 
     /// Get the total number of layers
     fn num_layers(&self) -> usize {
-        let layer_names = self.layer_names.read().expect("layer_names lock poisoned");
-        layer_names.len()
+        self.context.num_layers()
     }
 
     fn record_layer_event(&self, layer_name: &str, event: CudaEvent) {
-        let mut guard = self.layer_events.lock().expect("layer events map poisoned");
-
-        guard.insert(layer_name.to_string(), event);
+        self.context.record_layer_event(layer_name, event);
     }
 
     #[instrument(
@@ -202,14 +246,11 @@ impl PegaEngine {
             .get_layer_id(&layer_name)
             .unwrap_or_else(|| panic!("Layer {} not registered", layer_name));
 
-        // Acquire read lock for kv_caches and clone the registration
-        let registration = {
-            let kv_caches = self.kv_caches.read().expect("kv_caches lock poisoned");
-            kv_caches
-                .get(&layer_name)
-                .cloned()
-                .unwrap_or_else(|| panic!("Layer {} not registered", layer_name))
-        };
+        // Acquire the registration metadata for this layer
+        let registration = self
+            .context
+            .get_registration(&layer_name)
+            .unwrap_or_else(|| panic!("Layer {} not registered", layer_name));
 
         // Collect blocks that need to be saved
         let mut blocks_to_save = Vec::with_capacity(block_ids.len());
@@ -417,15 +458,12 @@ impl PegaEngine {
                 }
             };
 
-            // Acquire read lock for kv_caches and clone the registration
-            let registration = {
-                let kv_caches = self.kv_caches.read().expect("kv_caches lock poisoned");
-                match kv_caches.get(*layer_name).cloned() {
-                    Some(reg) => reg,
-                    None => {
-                        info!("Layer {} not registered, skipping", layer_name);
-                        continue;
-                    }
+            // Acquire registration metadata for this layer
+            let registration = match self.context.get_registration(layer_name) {
+                Some(reg) => reg,
+                None => {
+                    info!("Layer {} not registered, skipping", layer_name);
+                    continue;
                 }
             };
 
@@ -448,7 +486,7 @@ impl PegaEngine {
 
             // Perform transfer using existing logic
             let mut total_transfer = 0;
-            let stream = self.stream.clone();
+            let stream = self.context.stream();
 
             // Optimize for layer-first layout with KV stride
             if registration.segments == 2
@@ -581,10 +619,7 @@ impl PegaEngine {
 
     /// Block until the most recent async transfer for a layer finishes.
     pub fn wait_for_layer_transfer(&self, layer_name: &str) -> Result<(), String> {
-        let event = {
-            let mut guard = self.layer_events.lock().expect("layer events map poisoned");
-            guard.remove(layer_name)
-        };
+        let event = { self.context.take_layer_event(layer_name) };
 
         if let Some(event) = event {
             event
