@@ -38,7 +38,7 @@ use tracing::{debug, info, instrument};
 
 use crate::storage::{Block, StorageEngine};
 
-const DEFAULT_PINNED_POOL_BYTES: usize = 20 * 1024 * 1024 * 1024; // 10GB
+const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 10GB
 
 #[derive(Debug)]
 pub enum EngineError {
@@ -507,7 +507,7 @@ impl PegaEngine {
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
-        fields(layers = %layer_names.len(), blocks = %block_ids.len(), hashes = %block_hashes.len()),
+        fields(layers = %layer_names.len(), blocks = %block_ids.len(), hashes = %block_hashes.len(),context_id = %context_id),
     )]
     pub fn batch_load_kv_blocks_multi_layer(
         &self,

@@ -127,15 +127,45 @@ class PegaKVConnector(KVConnectorBase_V1):
         """
         super().__init__(vllm_config, role)
 
-        instance_id = getattr(vllm_config, "instance_id", "") or os.environ.get(
-            "PEGAFLOW_INSTANCE_ID", ""
-        )
-        if not instance_id:
-            instance_id = uuid.uuid4().hex
+        # Determine instance_id with DP rank support
+        # Priority:
+        # 1. kv_transfer_config.engine_id (already includes _dp{rank} suffix if DP is enabled)
+        # 2. vllm_config.instance_id or PEGAFLOW_INSTANCE_ID env var (need to append DP rank)
+        # 3. Generate a new UUID (need to append DP rank)
+
+        # Use kv_transfer_config.engine_id if available (already has DP rank suffix)
+        instance_id = vllm_config.kv_transfer_config.engine_id
+        if instance_id:
             logger.info(
-                "[PegaKVConnector] No instance_id from vLLM; generated fallback %s",
+                "[PegaKVConnector] Using kv_transfer_config.engine_id: %s",
                 instance_id,
             )
+        else:
+            # Fallback to instance_id or environment variable
+            instance_id = vllm_config.instance_id or os.environ.get(
+                "PEGAFLOW_INSTANCE_ID", ""
+            )
+            if not instance_id:
+                instance_id = uuid.uuid4().hex
+                logger.info(
+                    "[PegaKVConnector] No instance_id from vLLM; generated fallback %s",
+                    instance_id,
+                )
+
+            # If data parallelism is enabled, append local_dp_rank to ensure uniqueness
+            # This matches vLLM's behavior in core.py:_init_data_parallel()
+            parallel_config = vllm_config.parallel_config
+            if parallel_config.data_parallel_size > 1:
+                local_dp_rank = parallel_config.data_parallel_rank_local
+                if local_dp_rank is not None:
+                    instance_id = f"{instance_id}_dp{local_dp_rank}"
+                    logger.info(
+                        "[PegaKVConnector] Appended DP rank to instance_id: %s (dp_size=%d, local_dp_rank=%d)",
+                        instance_id,
+                        parallel_config.data_parallel_size,
+                        local_dp_rank,
+                    )
+
         self._instance_id = instance_id
 
         self._device_id: Optional[int] = None
@@ -211,8 +241,8 @@ class PegaKVConnector(KVConnectorBase_V1):
             self._engine_context = zmq.Context()
 
         self._engine_socket = self._engine_context.socket(zmq.REQ)
-        self._engine_socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
-        self._engine_socket.setsockopt(zmq.SNDTIMEO, 5000)
+        self._engine_socket.setsockopt(zmq.RCVTIMEO, 20000)  # 5 second timeout
+        self._engine_socket.setsockopt(zmq.SNDTIMEO, 20000)
         self._engine_socket.connect(self._engine_endpoint)
         logger.info("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 

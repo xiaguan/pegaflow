@@ -59,13 +59,14 @@ class VLLMServer:
             import os
             os.environ["LMCACHE_CHUNK_SIZE"] = "256"
             os.environ["LMCACHE_LOCAL_CPU"] = "True"
-            os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "12.0"
+            os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "32.0"
         
         cmd = [
             "vllm", "serve", self.model,
             "--port", str(self.port),
             "--enforce-eager",
             "--trust-remote-code",
+            "--data-parallel-size", "4",
             "--prefix-caching-hash-algo", "sha256_cbor",
         ]
 
@@ -286,13 +287,13 @@ def main():
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=3,
+        default=80,
         help="Number of prompts to benchmark (default: 20)"
     )
     parser.add_argument(
         "--input-len",
         type=int,
-        default=10000,
+        default=2048,
         help="Input prompt length in tokens (default: 1024)"
     )
     parser.add_argument(
@@ -322,7 +323,7 @@ def main():
     parser.add_argument(
         "--request-rate",
         type=float,
-        default=1.0,
+        default=8.0,
         help="Request rate in requests per second. Use 1.0 to send requests one by one. "
              "Use 'inf' for sending all at once (default: 1.0)"
     )
