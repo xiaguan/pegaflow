@@ -11,6 +11,8 @@ const RECLAIM_BATCH_OBJECTS: usize = 256;
 // up front and that count never changes for the lifetime of the engine, so
 // we treat it as immutable. Any attempt to resize the per-layer vector means
 // the registration logic violated this contract and should panic.
+// NOTE: Storage should avoid depending on per-context routing details; if KV reuse
+// requires context-specific handling it must be addressed in upper layers.
 
 pub type BlockHash = Vec<u8>;
 type LayerBlocks = Vec<Option<Arc<Block>>>;
