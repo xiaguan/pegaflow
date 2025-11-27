@@ -182,6 +182,7 @@ class PegaEngineServer:
                 'tp_rank': int,
                 'tp_size': int,
                 'num_layers': int,
+                'shm_name': str,  # shared memory name for sync state
             }
 
         Returns:
@@ -190,7 +191,7 @@ class PegaEngineServer:
         try:
             instance_id = self._require_instance_id(payload)
             tp_rank = self._require_tp_rank(payload)
-            
+
             layer_name = payload['layer_name']
             wrapper_bytes = payload['wrapper_bytes']
             num_blocks = payload['num_blocks']
@@ -202,6 +203,9 @@ class PegaEngineServer:
             # Topology info
             tp_size = payload['tp_size']
             num_layers = payload['num_layers']
+
+            # Shared memory name for sync state (optional for backward compatibility)
+            shm_name = payload.get('shm_name')
 
             # Use (instance_id, tp_rank) as key for keeping tensors alive in Python process
             context_key = f"{instance_id}:tp{tp_rank}"
@@ -235,6 +239,15 @@ class PegaEngineServer:
                 tp_size,
                 num_layers,
             )
+
+            # Attach sync state if shm_name is provided
+            # This allows the Rust engine to signal layer completion via shared memory
+            if shm_name:
+                self.engine.attach_sync_state(instance_id, tp_rank, shm_name, num_layers)
+                logger.info(
+                    "Attached sync state for instance %s rank %d (shm=%s)",
+                    instance_id, tp_rank, shm_name
+                )
 
             logger.info(
                 "Registered layer '%s' for instance %s rank %d (device %d): ptr=0x%x",

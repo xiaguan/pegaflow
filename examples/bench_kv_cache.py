@@ -66,7 +66,7 @@ class VLLMServer:
             "--port", str(self.port),
             "--enforce-eager",
             "--trust-remote-code",
-            "--data-parallel-size", "4",
+            "--data-parallel-size", "1",
             "--prefix-caching-hash-algo", "sha256_cbor",
         ]
 
@@ -287,7 +287,7 @@ def main():
     parser.add_argument(
         "--num-prompts",
         type=int,
-        default=80,
+        default=20,
         help="Number of prompts to benchmark (default: 20)"
     )
     parser.add_argument(
@@ -323,7 +323,7 @@ def main():
     parser.add_argument(
         "--request-rate",
         type=float,
-        default=8.0,
+        default=1.0,
         help="Request rate in requests per second. Use 1.0 to send requests one by one. "
              "Use 'inf' for sending all at once (default: 1.0)"
     )

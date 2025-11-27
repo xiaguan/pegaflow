@@ -1,9 +1,11 @@
 pub mod allocator;
 pub mod pinned_pool;
 mod storage;
+pub mod sync_state;
 mod transfer;
 
 pub use pinned_pool::PinnedAllocation;
+pub use sync_state::LayerSyncState;
 
 // ============================================================================
 // PegaEngine currently prioritizes vLLM's layer-first (KV-first) tensor layout.
@@ -97,6 +99,8 @@ struct WorkerContext {
     stream: Arc<CudaStream>,
     /// Track per-layer completion events for async loading
     layer_events: Mutex<HashMap<String, CudaEvent>>,
+    /// Shared memory sync state for async layer loading (attached from connector)
+    sync_state: Mutex<Option<Arc<LayerSyncState>>>,
     /// Hold CUDA context for the lifetime of the inference context
     _cuda_ctx: Arc<CudaContext>,
     device_id: i32,
@@ -111,6 +115,7 @@ impl WorkerContext {
             kv_caches: Mutex::new(HashMap::new()),
             stream,
             layer_events: Mutex::new(HashMap::new()),
+            sync_state: Mutex::new(None),
             _cuda_ctx: cuda_ctx,
             device_id,
         }
@@ -138,6 +143,16 @@ impl WorkerContext {
     fn take_layer_event(&self, layer_name: &str) -> Option<CudaEvent> {
         let mut guard = self.layer_events.lock().expect("layer events map poisoned");
         guard.remove(layer_name)
+    }
+
+    fn set_sync_state(&self, sync_state: Arc<LayerSyncState>) {
+        let mut guard = self.sync_state.lock().expect("sync_state lock poisoned");
+        *guard = Some(sync_state);
+    }
+
+    fn get_sync_state(&self) -> Option<Arc<LayerSyncState>> {
+        let guard = self.sync_state.lock().expect("sync_state lock poisoned");
+        guard.clone()
     }
 }
 
@@ -398,6 +413,34 @@ impl PegaEngine {
         Ok(())
     }
 
+    /// Attach a shared-memory sync state to a worker.
+    ///
+    /// The connector creates the sync state and passes the `shm_name` to the server.
+    /// The server then attaches to the same shared memory region.
+    #[instrument(level = "info", skip(self))]
+    pub fn attach_sync_state(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        shm_name: &str,
+        num_layers: usize,
+    ) -> Result<(), EngineError> {
+        let instance = self.get_instance(instance_id)?;
+        let worker = instance
+            .get_worker(tp_rank)
+            .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
+
+        let sync_state = LayerSyncState::attach(shm_name, num_layers)
+            .map_err(|e| EngineError::Storage(format!("failed to attach sync state: {e:?}")))?;
+
+        worker.set_sync_state(Arc::new(sync_state));
+        info!(
+            "Attached sync state for instance {} rank {} (shm={})",
+            instance_id, tp_rank, shm_name
+        );
+        Ok(())
+    }
+
     #[instrument(
         level = "debug",
         skip(self, block_ids, block_hashes),
@@ -590,14 +633,16 @@ impl PegaEngine {
         Ok(hit_count)
     }
 
-    /// Batch load KV blocks for multiple layers with shared block mapping
+    /// Batch load KV blocks for multiple layers with async completion notification.
     ///
-    /// This method optimizes loading the same blocks across multiple layers by:
-    /// 1. Looking up all block_hashes in storage ONCE
-    /// 2. For each layer, extracting blocks from the cached LayerBlocks
-    /// 3. Performing transfers for each layer
+    /// This method:
+    /// 1. Looks up all block_hashes in storage ONCE
+    /// 2. Submits async transfers for ALL layers
+    /// 3. Spawns a background thread that waits for each layer's CUDA event
+    ///    and marks the corresponding flag in shared memory sync_state
     ///
-    /// This reduces hash table lookups from O(layers × blocks) to O(blocks)
+    /// The connector can then use `wait_layer()` on the sync_state to wait
+    /// for each layer without ZMQ round-trips.
     ///
     /// Args:
     ///   - layer_names: List of layer names to load
@@ -627,6 +672,12 @@ impl PegaEngine {
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), tp_rank))?;
 
         let stream = worker.stream();
+        let sync_state = worker.get_sync_state();
+
+        // Reset sync_state flags if available
+        if let Some(ref ss) = sync_state {
+            ss.reset();
+        }
 
         // Step 1: Lookup all block_hashes ONCE and cache the blocks
         let shard_blocks_cache = self
@@ -634,12 +685,11 @@ impl PegaEngine {
             .lookup_many(block_hashes)
             .map_err(EngineError::Storage)?;
 
-        // Step 2: For each layer, extract blocks and perform transfer
+        // Step 2: Submit async transfers for ALL layers, collect events
         let mut results = Vec::with_capacity(layer_names.len());
+        let mut layer_events: Vec<(usize, CudaEvent)> = Vec::with_capacity(layer_names.len());
 
         for layer_name in layer_names {
-            let layer_start = Instant::now();
-
             let layer_id = match instance.get_layer_id(layer_name) {
                 Some(id) => id,
                 None => {
@@ -671,12 +721,15 @@ impl PegaEngine {
             }
 
             if blocks_to_load.is_empty() {
-                info!("No blocks to load for layer {}", layer_name);
+                // Still record event and mark done immediately if no blocks
+                if let Ok(event) = stream.record_event(None) {
+                    layer_events.push((layer_id, event));
+                }
                 continue;
             }
 
-            // Perform transfer using existing logic
-            let mut total_transfer = 0;
+            // Perform async transfer
+            let total_transfer;
 
             // Optimize for layer-first layout with KV stride
             if registration.segments == 2
@@ -710,7 +763,6 @@ impl PegaEngine {
                     let v_cpu_ptr = if let Some(v_ptr) = block.v_ptr() {
                         v_ptr as *const u8
                     } else {
-                        // If it was stored contiguously (e.g. old format), V follows K
                         unsafe { k_cpu_ptr.add(segment_size) }
                     };
 
@@ -722,7 +774,7 @@ impl PegaEngine {
                 k_transfers.sort_by_key(|&(offset, _)| offset);
                 v_transfers.sort_by_key(|&(offset, _)| offset);
 
-                // Batch copy K segments
+                // Batch copy K segments (async)
                 if let Err(e) = transfer::batch_copy_segments_to_gpu(
                     &k_transfers,
                     segment_size,
@@ -733,7 +785,7 @@ impl PegaEngine {
                     continue;
                 }
 
-                // Batch copy V segments
+                // Batch copy V segments (async)
                 if let Err(e) = transfer::batch_copy_segments_to_gpu(
                     &v_transfers,
                     segment_size,
@@ -747,6 +799,7 @@ impl PegaEngine {
                 total_transfer = blocks_to_load.len() * segment_size * 2;
             } else {
                 // Original logic for contiguous or single-segment layouts
+                let mut transfer_size = 0;
                 for (block_idx, block) in blocks_to_load {
                     match transfer::copy_block_cpu_to_gpu(
                         &registration,
@@ -755,7 +808,7 @@ impl PegaEngine {
                         &stream,
                     ) {
                         Ok(_) => {
-                            total_transfer += block.size();
+                            transfer_size += block.size();
                         }
                         Err(e) => {
                             info!(
@@ -765,12 +818,13 @@ impl PegaEngine {
                         }
                     }
                 }
+                total_transfer = transfer_size;
             }
 
-            // Record event for this layer
+            // Record event for this layer (after all transfers for this layer are queued)
             match stream.record_event(None) {
                 Ok(event) => {
-                    worker.record_layer_event(layer_name, event);
+                    layer_events.push((layer_id, event));
                 }
                 Err(e) => {
                     info!(
@@ -780,26 +834,31 @@ impl PegaEngine {
                 }
             }
 
-            let layer_elapsed = (Instant::now() - layer_start).as_secs_f64();
-            let bandwidth = if layer_elapsed > 0.0 {
-                total_transfer as f64 / layer_elapsed
-            } else {
-                0.0
-            };
-            debug!(
-                layer = layer_name,
-                total_transfer,
-                elapsed_us = (Instant::now() - layer_start).as_micros(),
-                bandwidth_gbps = bandwidth / 1e9,
-                "Completed layer transfer"
-            );
-
             results.push((layer_name.to_string(), total_transfer));
+        }
+
+        // Step 3: Spawn background thread to wait for events and mark sync_state
+        if let Some(sync_state) = sync_state {
+            std::thread::spawn(move || {
+                let start = std::time::Instant::now();
+
+                for (layer_id, event) in layer_events {
+                    // Wait for this layer's transfer to complete
+                    if let Err(e) = event.synchronize() {
+                        info!("Failed to sync event for layer {}: {:?}", layer_id, e);
+                    }
+                    // Mark layer as done in shared memory
+                    sync_state.mark_layer_done(layer_id);
+                }
+
+                let elapsed = start.elapsed();
+                info!("All layers synchronized in {:?} ", elapsed);
+            });
         }
 
         let total_elapsed = (Instant::now() - start_time).as_secs_f64();
         info!(
-            "batch_load_kv_blocks_multi_layer: completed {} layers in {:.3}s",
+            "batch_load_kv_blocks_multi_layer: submitted {} layers in {:.3}s",
             results.len(),
             total_elapsed
         );

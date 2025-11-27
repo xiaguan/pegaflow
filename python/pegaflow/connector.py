@@ -43,13 +43,16 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 # Import CUDA IPC wrapper for cross-process tensor sharing
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 
+# Import PyLayerSyncState for shared-memory based layer synchronization
+from pegaflow.pegaflow import PyLayerSyncState
+
 logger = logging.getLogger(__name__)
 # Enable INFO logs by default so required operational logs are visible even if
 # the host application doesn't configure logging.
 logger.setLevel(logging.INFO)
 
 # Environment variable to control timing logging
-_ENABLE_TIMING = os.environ.get("PEGAFLOW_ENABLE_TIMING", "1") == "1"
+_ENABLE_TIMING = os.environ.get("PEGAFLOW_ENABLE_TIMING", "0") == "1"
 
 
 def timing_wrapper(func):
@@ -68,7 +71,7 @@ def timing_wrapper(func):
             return result
         finally:
             elapsed_ms = (time.perf_counter() - start) * 1000
-            logger.debug(
+            logger.info(
                 "[PegaKVConnector] %s took %.2f ms",
                 func.__name__,
                 elapsed_ms,
@@ -219,6 +222,13 @@ class PegaKVConnector(KVConnectorBase_V1):
         # vLLM uses KV-first layout: (2, num_blocks, block_size, num_heads, head_dim)
         # where the first dimension (2) represents K and V separately.
 
+        # Shared-memory sync state for async layer loading (created in register_kv_caches)
+        self._sync_state: Optional[PyLayerSyncState] = None
+        # Mapping from layer name to layer ID (for sync_state indexing)
+        self._layer_name_to_id: Dict[str, int] = {}
+        # Flag to track if a load is currently in progress
+        # If False, wait_for_layer_load should return immediately
+        self._load_in_progress: bool = False
 
     # ==============================
     # Engine client helper methods
@@ -312,6 +322,10 @@ class PegaKVConnector(KVConnectorBase_V1):
             the same.
 
         """
+        # Reset load_in_progress flag at the start of each forward pass
+        # This ensures wait_for_layer_load returns immediately if no load is triggered
+        self._load_in_progress = False
+
         # ============================================================
         # STEP 1: Get connector metadata
         # ============================================================
@@ -345,7 +359,7 @@ class PegaKVConnector(KVConnectorBase_V1):
 
                 all_block_ids.extend(block_ids)
                 all_block_hashes.extend(block_hashes)
-            
+
             if not all_block_ids:
                 return
 
@@ -357,6 +371,9 @@ class PegaKVConnector(KVConnectorBase_V1):
 
             if not target_layers:
                 return
+
+            # Mark load as in progress - server will reset and set sync_state flags
+            self._load_in_progress = True
 
             # Batch load for all layers with async transfers
             response = self._send_engine_request('LOAD', {
@@ -388,6 +405,8 @@ class PegaKVConnector(KVConnectorBase_V1):
             )
 
         except Exception as e:
+            # On error, reset the flag so wait_for_layer_load doesn't hang
+            self._load_in_progress = False
             logger.debug(
                 "[PegaKVConnector] Error in start_load_kv: %s",
                 e,
@@ -400,14 +419,25 @@ class PegaKVConnector(KVConnectorBase_V1):
         paged buffer. This is called from within attention layer to ensure
         async copying from start_load_kv is complete.
 
-        This interface will be useful for layer-by-layer pipelining.
+        Uses shared-memory based spin-wait instead of ZMQ round-trips for
+        minimal latency.
 
         Args:
             layer_name: the name of that layer
         """
+        # If no load is in progress, return immediately
+        # This handles the case when start_load_kv returned early (no requests to load)
+        if not self._load_in_progress:
+            return
+
+        # Use shared-memory sync state for fast local spin-wait
+        if self._sync_state is not None and layer_name in self._layer_name_to_id:
+            layer_id = self._layer_name_to_id[layer_name]
+            self._sync_state.wait_layer(layer_id)
+            return
+
+        # Fallback to ZMQ call if sync_state not initialized
         try:
-            # TODO: if the model has 100 layers, we will send 100 requests to the engine
-            # That is not efficient. We should try to batch the requests.
             self._send_engine_request('WAIT_LAYER', {'layer_name': layer_name})
         except Exception as exc:
             logger.debug(
@@ -786,6 +816,16 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         self._registered_layers = list(kv_caches.keys())
 
+        # Create shared-memory sync state for async layer loading
+        # This is used by wait_for_layer_load to spin-wait locally instead of ZMQ calls
+        self._sync_state = PyLayerSyncState(self._num_layers)
+        shm_name = self._sync_state.shm_name()
+
+        # Build layer_name -> layer_id mapping (ordered by registration)
+        self._layer_name_to_id.clear()
+        for layer_id, layer_name in enumerate(kv_caches.keys()):
+            self._layer_name_to_id[layer_name] = layer_id
+
         for layer_name, kv_cache in kv_caches.items():
             if kv_cache.storage_offset() != 0:
                 raise RuntimeError(
@@ -829,6 +869,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                 )
 
             # Send to engine server for registration
+            # Include shm_name so server can attach to the shared memory sync state
             try:
                 payload = {
                     'layer_name': layer_name,
@@ -839,6 +880,7 @@ class PegaKVConnector(KVConnectorBase_V1):
                     'segments': segments,
                     'tp_size': self._tp_size,
                     'num_layers': self._num_layers,
+                    'shm_name': shm_name,
                 }
                 payload['device_id'] = self._device_id
                 self._send_engine_request('REGISTER_CONTEXT', payload)
@@ -848,10 +890,11 @@ class PegaKVConnector(KVConnectorBase_V1):
                 ) from e
 
         logger.info(
-            "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
+            "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s shm=%s",
             len(kv_caches),
             layout if kv_caches else "unknown",
             self._instance_id,
+            shm_name,
         )
 
     def unregister_context(self) -> None:

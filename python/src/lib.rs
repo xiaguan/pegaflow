@@ -1,6 +1,6 @@
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
-use pega_core::PegaEngine as CoreEngine;
+use pega_core::{LayerSyncState, PegaEngine as CoreEngine};
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 use tracing_subscriber::{
     fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
@@ -211,6 +211,84 @@ impl PegaEngine {
         })
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
+
+    /// Attach a shared-memory sync state to a worker.
+    ///
+    /// The connector creates the sync state and passes the shm_name to the server.
+    /// The server then attaches to the same shared memory region and uses it
+    /// to signal layer completion without ZMQ round-trips.
+    ///
+    /// Args:
+    ///     instance_id: ID of the model instance
+    ///     tp_rank: Tensor Parallel rank of the worker
+    ///     shm_name: Shared memory name from PyLayerSyncState.shm_name()
+    ///     num_layers: Number of layers in the model
+    fn attach_sync_state(
+        &self,
+        instance_id: &str,
+        tp_rank: usize,
+        shm_name: &str,
+        num_layers: usize,
+    ) -> PyResult<()> {
+        self.engine
+            .attach_sync_state(instance_id, tp_rank, shm_name, num_layers)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+}
+
+/// Python wrapper for LayerSyncState (shared-memory sync state for async layer loading)
+///
+/// Created by connector worker, passes shm_name to server.
+/// Then connector uses wait_layer() to spin-wait for layer completion.
+#[pyclass]
+struct PyLayerSyncState {
+    inner: Arc<LayerSyncState>,
+}
+
+#[pymethods]
+impl PyLayerSyncState {
+    /// Create a new LayerSyncState with the given number of layers.
+    ///
+    /// Args:
+    ///     num_layers: Number of layers in the model
+    #[new]
+    fn new(num_layers: usize) -> PyResult<Self> {
+        let inner = LayerSyncState::new(num_layers)
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to create sync state: {e:?}")))?;
+        Ok(Self {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Get the shared memory name to pass to the server.
+    fn shm_name(&self) -> String {
+        self.inner.shm_name().to_string()
+    }
+
+    /// Get the number of layers.
+    fn num_layers(&self) -> usize {
+        self.inner.num_layers()
+    }
+
+    /// Reset all flags to NOT_STARTED (call before starting a new load batch).
+    fn reset(&self) {
+        self.inner.reset();
+    }
+
+    /// Wait until a layer is completed (spin-wait).
+    ///
+    /// Args:
+    ///     layer_id: The layer ID to wait for (0-indexed)
+    fn wait_layer(&self, py: Python<'_>, layer_id: usize) {
+        py.allow_threads(|| {
+            self.inner.wait_layer(layer_id);
+        });
+    }
+
+    /// Check if a layer is completed (non-blocking).
+    fn is_layer_done(&self, layer_id: usize) -> bool {
+        self.inner.is_layer_done(layer_id)
+    }
 }
 
 /// A Python module implemented in Rust.
@@ -219,5 +297,6 @@ impl PegaEngine {
 fn pegaflow(m: &Bound<'_, PyModule>) -> PyResult<()> {
     init_tracing();
     m.add_class::<PegaEngine>()?;
+    m.add_class::<PyLayerSyncState>()?;
     Ok(())
 }
