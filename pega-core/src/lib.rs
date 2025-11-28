@@ -765,10 +765,6 @@ impl PegaEngine {
                     v_transfers.push((v_gpu_offset, v_cpu_ptr));
                 }
 
-                // Sort by GPU offset for batching
-                k_transfers.sort_by_key(|&(offset, _)| offset);
-                v_transfers.sort_by_key(|&(offset, _)| offset);
-
                 // Batch copy K segments (async)
                 if let Err(e) = transfer::batch_copy_segments_to_gpu(
                     &k_transfers,

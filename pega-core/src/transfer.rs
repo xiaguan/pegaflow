@@ -182,6 +182,9 @@ pub(crate) fn batch_copy_segments_to_gpu(
 
     let mut batch_count = 0;
     let mut i = 0;
+    let mut gpu_discontinuous_count = 0;
+    let mut cpu_discontinuous_count = 0;
+    let mut both_discontinuous_count = 0;
 
     while i < total_segments {
         let (start_gpu_offset, start_cpu_ptr) = transfers[i];
@@ -193,9 +196,20 @@ pub(crate) fn batch_copy_segments_to_gpu(
             let expected_gpu_offset = start_gpu_offset + count * segment_size;
             let expected_cpu_ptr = unsafe { start_cpu_ptr.add(count * segment_size) };
 
-            if next_gpu_offset == expected_gpu_offset && next_cpu_ptr == expected_cpu_ptr {
+            let gpu_contiguous = next_gpu_offset == expected_gpu_offset;
+            let cpu_contiguous = next_cpu_ptr == expected_cpu_ptr;
+
+            if gpu_contiguous && cpu_contiguous {
                 count += 1;
             } else {
+                // Track why we couldn't merge
+                if !gpu_contiguous && !cpu_contiguous {
+                    both_discontinuous_count += 1;
+                } else if !gpu_contiguous {
+                    gpu_discontinuous_count += 1;
+                } else {
+                    cpu_discontinuous_count += 1;
+                }
                 break;
             }
         }
@@ -217,12 +231,23 @@ pub(crate) fn batch_copy_segments_to_gpu(
         i += count;
     }
 
-    info!(
+    debug!(
         "CPU->GPU batch copy: {} segments -> {} batches ({}x reduction)",
         total_segments,
         batch_count,
         total_segments as f32 / batch_count as f32
     );
+
+    let total_breaks = gpu_discontinuous_count + cpu_discontinuous_count + both_discontinuous_count;
+    if total_breaks > 0 {
+        info!(
+            "CPU->GPU batch merge breaks: {} total (GPU discontinuous: {}, CPU discontinuous: {}, both: {})",
+            total_breaks,
+            gpu_discontinuous_count,
+            cpu_discontinuous_count,
+            both_discontinuous_count
+        );
+    }
 
     Ok(())
 }
