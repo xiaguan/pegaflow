@@ -113,14 +113,14 @@ uv run python examples/bench_kv_cache.py \
 
 H800 Reference Numbers
 
-PegaFlow TTFT measurements from an H800 (10 prompts, 4K-token prefill, 1-token decode):
+PegaFlow TTFT measurements from an H800 with Llama-3.1-8B (8 prompts, 10K-token prefill, 1-token decode, 4.0 req/s):
 
 | Configuration    | TTFT mean (ms) | TTFT p99 (ms) |
 |------------------|----------------|---------------|
-| PegaFlow (Cold)  | 193.0          | 302.2         |
-| PegaFlow (Warm)  | 54.7           | 63.2          |
+| PegaFlow (Cold)  | 572.5          | 1113.7        |
+| PegaFlow (Warm)  | 61.5           | 77.0          |
 
-The warm-start path shows significant TTFT improvement over cold-start, demonstrating effective KV cache sharing.
+The warm-start path achieves **~9x faster TTFT** compared to cold-start, demonstrating effective KV cache sharing across requests.
 
 ### vLLM Patch for Better I/O Performance
 
