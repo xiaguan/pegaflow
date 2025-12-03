@@ -13,6 +13,7 @@ bincode.workspace = true
 rand.workspace = true
 shared_memory.workspace = true
 uuid.workspace = true
+crossbeam.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

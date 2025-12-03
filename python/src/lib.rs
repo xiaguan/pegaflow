@@ -548,7 +548,7 @@ impl PyLoadState {
     #[new]
     fn new() -> PyResult<Self> {
         let inner = LoadState::new()
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to create LoadState: {e:?}")))?;
+            .map_err(|e| PyRuntimeError::new_err(format!("failed to create LoadState: {e}")))?;
         Ok(Self {
             inner: Arc::new(inner),
         })

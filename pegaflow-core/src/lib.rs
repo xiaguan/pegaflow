@@ -5,7 +5,7 @@ pub mod sync_state;
 mod transfer;
 
 pub use pinned_pool::PinnedAllocation;
-pub use sync_state::LoadState;
+pub use sync_state::{LoadState, LoadStateError};
 
 // ============================================================================
 // PegaEngine currently prioritizes vLLM's layer-first (KV-first) tensor layout.
@@ -38,7 +38,7 @@ use std::{
 };
 use tracing::{debug, info, instrument};
 
-use crate::storage::{Block, StorageEngine};
+use crate::storage::{LayerBlock, StorageEngine};
 
 const DEFAULT_PINNED_POOL_BYTES: usize = 30 * 1024 * 1024 * 1024; // 10GB
 
@@ -71,6 +71,12 @@ impl fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+impl From<LoadStateError> for EngineError {
+    fn from(err: LoadStateError) -> Self {
+        EngineError::Storage(format!("LoadState: {err}"))
+    }
+}
+
 pub struct PegaEngine {
     /// Manages instances and their GPU contexts
     instances: RwLock<HashMap<String, Arc<InstanceContext>>>,
@@ -99,7 +105,7 @@ struct GpuContext {
     stream: Arc<CudaStream>,
     /// Hold CUDA context for the lifetime of the inference context
     _cuda_ctx: Arc<CudaContext>,
-    device_id: i32,
+    _device_id: i32,
 }
 
 impl GpuContext {
@@ -111,7 +117,7 @@ impl GpuContext {
             kv_caches: Mutex::new(HashMap::new()),
             stream,
             _cuda_ctx: cuda_ctx,
-            device_id,
+            _device_id: device_id,
         }
     }
 
@@ -132,7 +138,7 @@ impl GpuContext {
 
 /// Global context for a Model Instance (across all device assignments)
 struct InstanceContext {
-    id: String,
+    _id: String,
     num_layers: usize,
     tp_size: usize,
     /// Maps layer name to layer ID (0..num_layers)
@@ -146,7 +152,7 @@ struct InstanceContext {
 impl InstanceContext {
     fn new(id: String, num_layers: usize, tp_size: usize) -> Self {
         Self {
-            id,
+            _id: id,
             num_layers,
             tp_size,
             layer_name_to_id: Mutex::new(HashMap::new()),
@@ -558,14 +564,14 @@ impl PegaEngine {
             )
             .unwrap();
 
-            // Create Block objects after all copying is done
+            // Create LayerBlock objects after all copying is done
             for (i, (_, block_hash)) in blocks_to_save.into_iter().enumerate() {
                 let k_ptr = unsafe { k_base_ptr.add(i * segment_size) };
                 let v_ptr = unsafe { v_base_ptr.add(i * segment_size) };
 
                 // We now keep K and V data in separate allocations during their lifetime
                 // This avoids the memory overwrite bug and keeps data contiguous for better batching next time
-                let block = Arc::new(Block::new_split(
+                let block = Arc::new(LayerBlock::new_split(
                     k_ptr,
                     v_ptr,
                     block_size,
@@ -574,7 +580,8 @@ impl PegaEngine {
                 ));
 
                 self.storage
-                    .insert_block(block_hash, slot_id, block, total_slots);
+                    .insert_block(block_hash, slot_id, block, total_slots)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
             }
         } else {
             // Original logic for contiguous or single-segment layouts
@@ -593,19 +600,20 @@ impl PegaEngine {
                 .expect("allocation should be unique before cloning")
                 .as_mut_ptr();
 
-            // Copy blocks and create Block objects
+            // Copy blocks and create LayerBlock objects
             for (i, (block_idx, block_hash)) in blocks_to_save.into_iter().enumerate() {
                 let cpu_ptr = unsafe { base_ptr.add(i * block_size) };
                 transfer::copy_block_gpu_to_cpu(&registration, block_idx, cpu_ptr).unwrap();
 
-                let block = Arc::new(Block::new_contiguous(
+                let block = Arc::new(LayerBlock::new_contiguous(
                     cpu_ptr,
                     block_size,
                     Arc::clone(&allocation),
                 ));
 
                 self.storage
-                    .insert_block(block_hash, slot_id, block, total_slots);
+                    .insert_block(block_hash, slot_id, block, total_slots)
+                    .map_err(|e| EngineError::Storage(e.to_string()))?;
             }
         }
         Ok(())
@@ -671,8 +679,7 @@ impl PegaEngine {
         block_hashes: &[Vec<u8>],
     ) -> Result<(), EngineError> {
         // Attach to LoadState early so we can set error if something fails
-        let load_state = LoadState::attach(load_state_shm)
-            .map_err(|e| EngineError::Storage(format!("failed to attach LoadState: {e:?}")))?;
+        let load_state = LoadState::attach(load_state_shm)?;
 
         let instance = self.get_instance(instance_id)?;
         let worker = instance
@@ -680,7 +687,7 @@ impl PegaEngine {
             .ok_or_else(|| EngineError::WorkerMissing(instance_id.to_string(), device_id))?;
 
         // Lookup all block_hashes ONCE and cache the blocks
-        let shard_blocks_cache = self
+        let block_cache = self
             .storage
             .lookup_many(block_hashes)
             .map_err(EngineError::Storage)?;
@@ -706,14 +713,12 @@ impl PegaEngine {
                 // Collect valid blocks to load for this layer
                 let blocks_to_load: Vec<_> = block_ids
                     .iter()
-                    .zip(shard_blocks_cache.iter())
-                    .filter_map(|(block_id, shard_blocks_arc)| {
+                    .zip(block_cache.iter())
+                    .filter_map(|(block_id, block_entry)| {
                         let block_idx = *block_id as usize;
-                        let blocks = shard_blocks_arc.lock_blocks();
-                        blocks
-                            .get(slot_id)
-                            .and_then(|opt| opt.as_ref())
-                            .map(|block| (block_idx, block.clone()))
+                        block_entry
+                            .get_slot(slot_id)
+                            .map(|block| (block_idx, block))
                     })
                     .collect();
 
@@ -772,7 +777,7 @@ impl PegaEngine {
                             block.k_ptr(),
                             &stream,
                         )
-                        .expect("Block copy should succeed");
+                        .expect("LayerBlock copy should succeed");
                         total_bytes += block.size();
                     }
                     total_blocks += blocks_to_load.len();

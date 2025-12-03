@@ -1,3 +1,4 @@
+use crossbeam::sync::ShardedLock;
 // ============================================================================
 // StorageEngine eviction + layout notes (mirrors the high-level summary in
 // lib.rs):
@@ -6,9 +7,9 @@
 //   utilization levels). On failure we drop a batch of LRU entries and retry.
 // - Eviction is batched (RECLAIM_BATCH_OBJECTS) so a single allocation failure
 //   can free multiple cached objects at once instead of thrashing.
-// - LRU key: BlockHash (Vec<u8> digest for a shard of KV blocks).
-//   LRU value: Vec<Option<Arc<Block>>> ordered by flat slot id
-//   (slot_id = layer_id * tp_size + tp_rank).
+// - LRU key: BlockHash (Vec<u8> digest for one logical block across layers/TP ranks).
+//   LRU value: Block (stateful set of LayerBlock slots, ordered by flat slot id
+//   slot_id = layer_id * tp_size + tp_rank).
 // - CPU memory picture for one hash (split K/V storage):
 //     BlockHash ->
 //       K range: [slot0 K data][slot1 K data][slot2 K data]...
@@ -18,9 +19,9 @@
 //   and the V bytes follow K in the same allocation.
 // ============================================================================
 use hashlink::LruCache;
+use std::fmt;
 use std::num::NonZeroU64;
-use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 use tracing::{error, info};
 
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
@@ -34,89 +35,177 @@ const RECLAIM_BATCH_OBJECTS: usize = 256;
 // NOTE: Storage is generic and operates on flat indices (slots).
 
 pub type BlockHash = Vec<u8>;
-type ShardBlocks = Vec<Option<Arc<Block>>>;
+type LayerBlockSlots = Vec<Option<Arc<LayerBlock>>>;
 
-struct ShardBlocksState {
-    blocks: ShardBlocks,
-    is_complete: bool,
+/// State machine for a logical block (all layer/TP slots for one hash).
+enum BlockState {
+    /// In-flight, still accepting writes for empty slots.
+    Filling(FillingBlock),
+    /// Fully populated; read-only view.
+    Sealed(SealedBlock),
 }
 
-impl ShardBlocksState {
-    fn new(num_slots: usize) -> Self {
+/// Mutable block while we are still receiving layer slots.
+struct FillingBlock {
+    slots: LayerBlockSlots,
+    remaining: usize,
+    total_slots: usize,
+}
+
+impl FillingBlock {
+    fn new(total_slots: usize) -> Self {
         Self {
-            blocks: vec![None; num_slots],
-            is_complete: false,
+            slots: vec![None; total_slots],
+            remaining: total_slots,
+            total_slots,
         }
     }
 
-    fn mark_slot_ready(&mut self, slot_id: usize, block: Arc<Block>) {
-        assert!(
-            slot_id < self.blocks.len(),
-            "slot_id {} out of bounds ({} slots)",
-            slot_id,
-            self.blocks.len()
-        );
-        self.blocks[slot_id] = Some(block);
-        self.is_complete = self.blocks.iter().all(|opt| opt.is_some());
+    fn slot_has_block(&self, slot_id: usize) -> bool {
+        self.slots
+            .get(slot_id)
+            .and_then(|opt| opt.as_ref())
+            .is_some()
+    }
+
+    fn get_slot(&self, slot_id: usize) -> Option<Arc<LayerBlock>> {
+        self.slots.get(slot_id).and_then(|opt| opt.clone())
+    }
+
+    fn insert_slot(
+        &mut self,
+        slot_id: usize,
+        block: Arc<LayerBlock>,
+        total_slots: usize,
+    ) -> Result<bool, BlockInsertError> {
+        if total_slots != self.total_slots {
+            return Err(BlockInsertError::SlotCountMismatch {
+                expected: self.total_slots,
+                got: total_slots,
+            });
+        }
+
+        if slot_id >= self.total_slots {
+            return Err(BlockInsertError::SlotOutOfBounds {
+                slot_id,
+                total_slots: self.total_slots,
+            });
+        }
+
+        if self.slots[slot_id].is_some() {
+            return Err(BlockInsertError::SlotAlreadyFilled { slot_id });
+        }
+
+        self.slots[slot_id] = Some(block);
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .expect("remaining should not underflow");
+        Ok(self.remaining == 0)
     }
 }
 
-/// Wrapper for per-slot block vectors with a fixed weight for cache eviction.
-pub struct ShardBlocksWithWeight {
-    inner: Mutex<ShardBlocksState>,
+/// Immutable view after all slots are filled; no further writes allowed.
+struct SealedBlock {
+    slots: Arc<[Arc<LayerBlock>]>,
 }
 
-impl ShardBlocksWithWeight {
-    pub fn new(num_slots: usize) -> Self {
+impl SealedBlock {
+    fn slot_has_block(&self, slot_id: usize) -> bool {
+        self.slots.get(slot_id).is_some()
+    }
+
+    fn get_slot(&self, slot_id: usize) -> Option<Arc<LayerBlock>> {
+        self.slots.get(slot_id).cloned()
+    }
+}
+
+/// State machine for a logical block (all layer/TP slots for one hash).
+impl BlockState {
+    fn insert_slot(
+        &mut self,
+        slot_id: usize,
+        block: Arc<LayerBlock>,
+        total_slots: usize,
+    ) -> Result<(), BlockInsertError> {
+        match self {
+            BlockState::Filling(filling) => {
+                let completed = filling.insert_slot(slot_id, block, total_slots)?;
+                if completed {
+                    let sealed_slots: Vec<Arc<LayerBlock>> = filling
+                        .slots
+                        .iter()
+                        .map(|opt| opt.as_ref().expect("all slots filled").clone())
+                        .collect();
+                    *self = BlockState::Sealed(SealedBlock {
+                        slots: sealed_slots.into(),
+                    });
+                }
+                Ok(())
+            }
+            BlockState::Sealed(_) => Err(BlockInsertError::Sealed),
+        }
+    }
+
+    fn slot_has_block(&self, slot_id: usize) -> bool {
+        match self {
+            BlockState::Filling(filling) => filling.slot_has_block(slot_id),
+            BlockState::Sealed(sealed) => sealed.slot_has_block(slot_id),
+        }
+    }
+
+    fn get_slot(&self, slot_id: usize) -> Option<Arc<LayerBlock>> {
+        match self {
+            BlockState::Filling(filling) => filling.get_slot(slot_id),
+            BlockState::Sealed(sealed) => sealed.get_slot(slot_id),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self, BlockState::Sealed(_))
+    }
+}
+
+/// Wrapper for per-slot layer blocks with a fixed weight for cache eviction.
+pub struct Block {
+    inner: ShardedLock<BlockState>,
+}
+
+impl Block {
+    pub fn new(total_slots: usize) -> Self {
         Self {
-            inner: Mutex::new(ShardBlocksState::new(num_slots)),
+            inner: ShardedLock::new(BlockState::Filling(FillingBlock::new(total_slots))),
         }
     }
 
-    pub fn lock_blocks(&self) -> ShardBlocksGuard<'_> {
-        ShardBlocksGuard {
-            inner: self.lock_state(),
-        }
+    pub fn insert_slot(
+        &self,
+        slot_id: usize,
+        block: Arc<LayerBlock>,
+        total_slots: usize,
+    ) -> Result<(), BlockInsertError> {
+        let mut state = self.inner.write().expect("block entry write lock poisoned");
+        state.insert_slot(slot_id, block, total_slots)
+    }
+
+    pub fn slot_has_block(&self, slot_id: usize) -> bool {
+        let state = self.inner.read().expect("block entry lock poisoned");
+        state.slot_has_block(slot_id)
+    }
+
+    pub fn get_slot(&self, slot_id: usize) -> Option<Arc<LayerBlock>> {
+        let state = self.inner.read().expect("block entry lock poisoned");
+        state.get_slot(slot_id)
     }
 
     pub fn is_complete(&self) -> bool {
-        self.inner
-            .lock()
-            .expect("layer blocks lock poisoned")
-            .is_complete
-    }
-
-    fn lock_state(&self) -> MutexGuard<'_, ShardBlocksState> {
-        self.inner.lock().expect("shard blocks lock poisoned")
+        let state = self.inner.read().expect("block entry lock poisoned");
+        state.is_complete()
     }
 }
 
-pub struct ShardBlocksGuard<'a> {
-    inner: MutexGuard<'a, ShardBlocksState>,
-}
-
-impl<'a> Deref for ShardBlocksGuard<'a> {
-    type Target = ShardBlocks;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner.blocks
-    }
-}
-
-impl<'a> DerefMut for ShardBlocksGuard<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner.blocks
-    }
-}
-
-impl<'a> ShardBlocksGuard<'a> {
-    pub fn mark_slot_ready(&mut self, slot_id: usize, block: Arc<Block>) {
-        self.inner.mark_slot_ready(slot_id, block);
-    }
-}
-
-/// CPU block data stored in pinned memory.
-pub struct Block {
+/// CPU block data stored in pinned memory for a single layer/TP slot.
+pub struct LayerBlock {
     /// Pointer to K segment (or combined data if contiguous)
     k_ptr: std::ptr::NonNull<u8>,
     /// Pointer to V segment (if stored separately)
@@ -130,7 +219,7 @@ pub struct Block {
     v_allocation: Option<Arc<PinnedAllocation>>,
 }
 
-impl Block {
+impl LayerBlock {
     pub fn new_contiguous(ptr: *mut u8, size: usize, allocation: Arc<PinnedAllocation>) -> Self {
         let k_ptr =
             std::ptr::NonNull::new(ptr).expect("contiguous block K pointer must be non-null");
@@ -161,14 +250,6 @@ impl Block {
         }
     }
 
-    pub fn k_ptr_mut(&mut self) -> *mut u8 {
-        self.k_ptr.as_ptr()
-    }
-
-    pub fn v_ptr_mut(&mut self) -> Option<*mut u8> {
-        self.v_ptr.map(|ptr| ptr.as_ptr())
-    }
-
     pub fn k_ptr(&self) -> *const u8 {
         self.k_ptr.as_ptr()
     }
@@ -183,11 +264,11 @@ impl Block {
 }
 
 // Safety: pinned memory ownership is tracked by Arc counters on the allocations.
-unsafe impl Send for Block {}
-unsafe impl Sync for Block {}
+unsafe impl Send for LayerBlock {}
+unsafe impl Sync for LayerBlock {}
 
 pub struct StorageEngine {
-    kv_storage: Mutex<LruCache<BlockHash, Arc<ShardBlocksWithWeight>>>,
+    kv_storage: Mutex<LruCache<BlockHash, Arc<Block>>>,
     pinned_pool: Arc<PinnedMemoryPool>,
 }
 
@@ -248,10 +329,7 @@ impl StorageEngine {
         let mut cache = self.kv_storage.lock().unwrap();
         cache
             .get(block_hash)
-            .map(|blocks| {
-                let blocks = blocks.lock_blocks();
-                blocks.get(slot_id).and_then(|opt| opt.as_ref()).is_some()
-            })
+            .map(|blocks| blocks.slot_has_block(slot_id))
             .unwrap_or(false)
     }
 
@@ -267,23 +345,19 @@ impl StorageEngine {
         &self,
         block_hash: BlockHash,
         slot_id: usize,
-        block: Arc<Block>,
+        block: Arc<LayerBlock>,
         total_slots: usize,
-    ) {
+    ) -> Result<(), BlockInsertError> {
         let mut cache = self.kv_storage.lock().unwrap();
         let entry = cache.get(&block_hash).cloned().unwrap_or_else(|| {
-            let new_blocks = Arc::new(ShardBlocksWithWeight::new(total_slots));
+            let new_blocks = Arc::new(Block::new(total_slots));
             cache.insert(block_hash.clone(), Arc::clone(&new_blocks));
             new_blocks
         });
-        let mut blocks = entry.lock_blocks();
-        blocks.mark_slot_ready(slot_id, block);
+        entry.insert_slot(slot_id, block, total_slots)
     }
 
-    pub fn lookup_many(
-        &self,
-        block_hashes: &[Vec<u8>],
-    ) -> Result<Vec<Arc<ShardBlocksWithWeight>>, String> {
+    pub fn lookup_many(&self, block_hashes: &[Vec<u8>]) -> Result<Vec<Arc<Block>>, String> {
         let mut cache = self.kv_storage.lock().unwrap();
         let mut result = Vec::with_capacity(block_hashes.len());
         for hash in block_hashes {
@@ -296,3 +370,37 @@ impl StorageEngine {
         Ok(result)
     }
 }
+
+#[derive(Debug)]
+pub enum BlockInsertError {
+    Sealed,
+    SlotOutOfBounds { slot_id: usize, total_slots: usize },
+    SlotAlreadyFilled { slot_id: usize },
+    SlotCountMismatch { expected: usize, got: usize },
+}
+
+impl fmt::Display for BlockInsertError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BlockInsertError::Sealed => write!(f, "block is sealed and read-only"),
+            BlockInsertError::SlotOutOfBounds {
+                slot_id,
+                total_slots,
+            } => {
+                write!(
+                    f,
+                    "slot_id {} out of bounds ({} slots)",
+                    slot_id, total_slots
+                )
+            }
+            BlockInsertError::SlotAlreadyFilled { slot_id } => {
+                write!(f, "slot_id {} already has data", slot_id)
+            }
+            BlockInsertError::SlotCountMismatch { expected, got } => {
+                write!(f, "slot count mismatch: expected {}, got {}", expected, got)
+            }
+        }
+    }
+}
+
+impl std::error::Error for BlockInsertError {}
