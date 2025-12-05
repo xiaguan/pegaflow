@@ -274,16 +274,20 @@ def main():
     print("\nWaiting for vLLM nodes to initialize...")
     time.sleep(10)
 
-    # Start Router
+    # Start Router (Rust version)
+    # Get project root directory (assuming this script is in examples/)
+    project_root = Path(__file__).parent.parent.resolve()
+
     router_cmd = [
-        sys.executable, "-m", "pegaflow.pd_router",
+        "cargo", "run", "--release", "--bin", "pegaflow-router", "--",
         "--host", "0.0.0.0",
         "--port", str(args.router_port),
         "--prefill", *p_endpoints,
         "--decode", *d_endpoints,
     ]
 
-    print(f"\n[Router] Starting router on port {args.router_port}")
+    print(f"\n[Router] Starting Rust pegaflow-router on port {args.router_port}")
+    print(f"[Router] Working directory: {project_root}")
     print(f"[Router] Command: {' '.join(router_cmd)}")
 
     if run_dir:
@@ -291,9 +295,9 @@ def main():
         print(f"[Router] Log file: {log_file}")
         log_handle = open(log_file, 'w')
         log_handles.append(log_handle)
-        router_p = subprocess.Popen(router_cmd, env=base_env, stdout=log_handle, stderr=subprocess.STDOUT)
+        router_p = subprocess.Popen(router_cmd, cwd=project_root, env=base_env, stdout=log_handle, stderr=subprocess.STDOUT)
     else:
-        router_p = subprocess.Popen(router_cmd, env=base_env)
+        router_p = subprocess.Popen(router_cmd, cwd=project_root, env=base_env)
     processes.append(router_p)
 
     print("\n" + "=" * 60)
