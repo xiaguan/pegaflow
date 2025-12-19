@@ -154,19 +154,24 @@ class SchedulerConnector:
                 save_intents[req_id] = save_intent
 
         logger.debug(
-            "[PegaKVConnector] build_connector_meta: %d loads, %d saves",
+            "[PegaKVConnector] build_connector_meta: %d loads, %d saves, %d held",
             len(load_intents),
             len(save_intents),
+            len(self._held_requests),
         )
 
         return PegaConnectorMetadata(
             load_intents=load_intents,
             save_intents=save_intents,
+            finished_requests=self._held_requests.copy(),
         )
 
     def update_connector_output(self,
                                 connector_output: "KVConnectorOutput") -> None:
         for req_id in connector_output.finished_sending or []:
+            # Remove from held requests now that save is complete
+            self._held_requests.discard(req_id)
+
             tracker = self._trackers.get(req_id)
             if tracker:
                 while tracker._saved_layers < tracker._total_layers:

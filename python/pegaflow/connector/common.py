@@ -230,15 +230,18 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         self,
         load_intents: dict[str, LoadIntent] | None = None,
         save_intents: dict[str, SaveIntent] | None = None,
+        finished_requests: set[str] | None = None,
     ):
         super().__init__()
         # Maps request_id -> intent
         self.load_intents: dict[str, LoadIntent] = load_intents or {}
         self.save_intents: dict[str, SaveIntent] = save_intents or {}
+        # Requests that have finished generation and are waiting for save to complete
+        self.finished_requests: set[str] = finished_requests or set()
 
     def __repr__(self) -> str:
         return (f"PegaConnectorMetadata(loads={len(self.load_intents)}, "
-                f"saves={len(self.save_intents)})")
+                f"saves={len(self.save_intents)}, finished={len(self.finished_requests)})")
 
 
 def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:

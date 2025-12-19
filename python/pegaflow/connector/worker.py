@@ -48,6 +48,9 @@ class WorkerConnector:
 
         self._current_save_intents: set[str] = set()
 
+        # Requests that scheduler says have finished generation (held for async save)
+        self._finished_requests: set[str] = set()
+
         self._pending_loads: dict[str, PyLoadState] = {}
         self._pending_load_reqs: dict[str, set[str]] = {}
         self._load_completion_lock = threading.Lock()
@@ -142,10 +145,30 @@ class WorkerConnector:
         finished_recving: set[str] | None = None
 
         with self._save_completion_lock:
-            done_saves = self._completed_saves & finished_req_ids
+            # Return saves that are completed AND either:
+            # 1. In finished_req_ids (request fully done), OR
+            # 2. In _finished_requests (request finished but blocks held for async save)
+            eligible = finished_req_ids | self._finished_requests
+            done_saves = self._completed_saves & eligible
+
             if done_saves:
                 self._completed_saves -= done_saves
+                self._finished_requests -= done_saves
                 finished_sending = done_saves
+                logger.info(
+                    "[PegaKVConnector] get_finished: returning finished_sending=%s",
+                    finished_sending,
+                )
+
+            # Debug: log state for requests that are finished but not in completed_saves
+            pending_but_finished = finished_req_ids & set(self._req_pending_layers.keys())
+            if pending_but_finished:
+                for req_id in pending_but_finished:
+                    logger.warning(
+                        "[PegaKVConnector] req %s finished but still has %d pending layers",
+                        req_id,
+                        self._req_pending_layers.get(req_id, -1),
+                    )
 
         with self._load_completion_lock:
             completed_reqs: set[str] = set()
@@ -200,6 +223,11 @@ class WorkerConnector:
                       forward_context: "ForwardContext",
                       **kwargs: Any) -> None:
         self._current_save_intents = set(metadata.save_intents.keys())
+
+        # Track requests that have finished generation (from scheduler)
+        if metadata.finished_requests:
+            with self._save_completion_lock:
+                self._finished_requests.update(metadata.finished_requests)
 
         if not metadata.load_intents:
             return
@@ -284,6 +312,15 @@ class WorkerConnector:
                 if req_id not in self._req_pending_layers:
                     self._req_pending_layers[req_id] = len(
                         self._registered_layers)
+                    # Debug: log new save step starting
+                    in_completed = req_id in self._completed_saves
+                    logger.info(
+                        "[PegaKVConnector] save step START: req=%s layer=%s pending=%d in_completed=%s",
+                        req_id,
+                        layer_name,
+                        self._req_pending_layers[req_id],
+                        in_completed,
+                    )
 
         self._save_queue.put(SaveTask(
             layer_name=layer_name,
@@ -407,13 +444,25 @@ class WorkerConnector:
             for req_id in request_ids:
                 if req_id in self._req_pending_layers:
                     self._req_pending_layers[req_id] -= 1
-                    assert self._req_pending_layers[req_id] >= 0, \
+                    remaining = self._req_pending_layers[req_id]
+                    assert remaining >= 0, \
                         f"Layer count mismatch for request {req_id}: counter went negative"
 
-                    if self._req_pending_layers[req_id] == 0:
+                    if remaining == 0:
                         self._completed_saves.add(req_id)
                         del self._req_pending_layers[req_id]
                         completed_reqs.append(req_id)
+                        logger.info(
+                            "[PegaKVConnector] save step DONE: req=%s completed_saves_size=%d",
+                            req_id,
+                            len(self._completed_saves),
+                        )
+                else:
+                    # Debug: unexpected state
+                    logger.warning(
+                        "[PegaKVConnector] decrement called for req=%s but not in pending_layers",
+                        req_id,
+                    )
 
         self._handle_save_completion(completed_reqs)
 
