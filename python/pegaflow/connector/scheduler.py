@@ -104,7 +104,8 @@ class SchedulerConnector:
                     len(load_intent.block_ids),
                     load_intent.num_tokens,
                 )
-            else:
+            elif tracker._loaded_blocks < tracker._hit_blocks:
+                # Only warn if we expected to load more blocks but couldn't
                 logger.warning(
                     "[PegaKVConnector] update_state_after_alloc req=%s external_tokens=%d "
                     "but NO LoadIntent created (loaded_blocks=%d, needs_load=%s, "
@@ -116,6 +117,14 @@ class SchedulerConnector:
                     tracker._hit_blocks,
                     len(tracker._allocated_blocks),
                     tracker._computed_blocks,
+                )
+            else:
+                # All available blocks already loaded - this is expected for subsequent calls
+                logger.debug(
+                    "[PegaKVConnector] update_state_after_alloc req=%s all %d hit blocks "
+                    "already loaded",
+                    req_id,
+                    tracker._loaded_blocks,
                 )
 
         logger.debug(

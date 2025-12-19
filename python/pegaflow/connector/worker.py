@@ -174,13 +174,31 @@ class WorkerConnector:
             completed_reqs: set[str] = set()
             completed_shms: list[str] = []
 
+            # Debug: log pending loads
+            if self._pending_load_reqs:
+                logger.info(
+                    "[PegaKVConnector] get_finished: checking %d pending load shms",
+                    len(self._pending_load_reqs),
+                )
+
             for shm_name, req_ids in self._pending_load_reqs.items():
                 sample_req_id = next(iter(req_ids))
                 load_state = self._pending_loads.get(sample_req_id)
                 if load_state is None:
+                    logger.warning(
+                        "[PegaKVConnector] get_finished: no load_state for shm=%s req=%s",
+                        shm_name, sample_req_id,
+                    )
                     continue
 
-                if load_state.is_ready():
+                is_ready = load_state.is_ready()
+                if not is_ready:
+                    logger.debug(
+                        "[PegaKVConnector] get_finished: load not ready for shm=%s reqs=%s",
+                        shm_name, req_ids,
+                    )
+
+                if is_ready:
                     state = load_state.get_state()
                     if state < 0:
                         logger.error(
@@ -204,6 +222,10 @@ class WorkerConnector:
 
             if completed_reqs:
                 finished_recving = completed_reqs
+                logger.info(
+                    "[PegaKVConnector] get_finished: returning finished_recving=%s",
+                    finished_recving,
+                )
 
         if finished_sending:
             logger.debug(
@@ -282,14 +304,15 @@ class WorkerConnector:
                 self._pending_loads[req_id] = load_state
             self._pending_load_reqs[shm_name] = set(request_ids)
 
-        logger.debug(
+        logger.info(
             "[PegaKVConnector] started async load: %d blocks across %d layers for %d reqs, "
-            "schedule %.0f us, shm=%s",
+            "schedule %.0f us, shm=%s, req_ids=%s",
             num_blocks,
             num_layers,
             total_requests,
             schedule_time_us,
             shm_name,
+            request_ids,
         )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
