@@ -3,6 +3,7 @@ from __future__ import annotations
 Facade for the PegaFlow vLLM connector, split into scheduler/worker implementations.
 """
 
+import os
 import torch
 from typing import Any, Iterable, Optional, Tuple
 
@@ -46,7 +47,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         if role == KVConnectorRole.WORKER:
             tp_rank = get_tensor_model_parallel_rank()
             if torch.cuda.is_available():
-                device_id = torch.cuda.current_device()
+                device_id = _resolve_device_id()
 
         self._engine_endpoint = ENGINE_ENDPOINT
         engine_client = EngineRpcClient(self._engine_endpoint)
@@ -204,6 +205,31 @@ class PegaKVConnector(KVConnectorBase_V1):
     def shutdown(self):
         if self._worker:
             self._worker.shutdown()
+
+
+def _resolve_device_id() -> int:
+    """
+    Return the global CUDA device id even when CUDA_VISIBLE_DEVICES masks GPUs.
+
+    torch.cuda.current_device() returns the local index within the visible set,
+    but we need the actual global device ID for operations like CUDA IPC.
+    This function maps the local index back to the global device ID.
+    """
+    local_id = torch.cuda.current_device()
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return local_id
+
+    slots = [slot.strip() for slot in visible.split(",") if slot.strip()]
+    try:
+        mapped = slots[local_id]
+    except IndexError:
+        return local_id
+
+    try:
+        return int(mapped)
+    except ValueError:
+        return local_id
 
 
 __all__ = ["PegaKVConnector", "KVConnectorRole"]

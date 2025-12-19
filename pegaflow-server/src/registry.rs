@@ -47,7 +47,9 @@ impl CudaTensorRegistry {
             let torch = py.import("torch")?;
             let cuda = torch.getattr("cuda")?;
             cuda.call_method0("init")?;
-            Ok(Self { contexts: HashMap::new() })
+            Ok(Self {
+                contexts: HashMap::new(),
+            })
         })
     }
 

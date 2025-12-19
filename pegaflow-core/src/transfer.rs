@@ -112,7 +112,6 @@ pub(crate) fn copy_cpu_to_gpu_async(
     Ok(())
 }
 
-
 /// Batch copy segments from CPU to GPU by finding and merging contiguous ranges
 pub(crate) fn batch_copy_segments_to_gpu(
     transfers: &[(usize, *const u8)],

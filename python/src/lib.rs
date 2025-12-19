@@ -190,8 +190,6 @@ impl PegaEngine {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
-
-
     /// Count how many blocks from the prefix are available in CPU storage
     ///
     /// Returns the number of contiguous blocks available from the start.
