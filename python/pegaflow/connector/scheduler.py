@@ -97,12 +97,25 @@ class SchedulerConnector:
             load_intent = tracker.consume_load_intent()
             if load_intent is not None:
                 self._pending_load_intents[req_id] = load_intent
-                logger.debug(
+                logger.info(
                     "[PegaKVConnector] update_state_after_alloc req=%s created LoadIntent: "
                     "%d blocks, %d tokens",
                     req_id,
                     len(load_intent.block_ids),
                     load_intent.num_tokens,
+                )
+            else:
+                logger.warning(
+                    "[PegaKVConnector] update_state_after_alloc req=%s external_tokens=%d "
+                    "but NO LoadIntent created (loaded_blocks=%d, needs_load=%s, "
+                    "hit_blocks=%d, allocated=%d, computed=%d)",
+                    req_id,
+                    num_external_tokens,
+                    tracker._loaded_blocks,
+                    tracker._needs_load,
+                    tracker._hit_blocks,
+                    len(tracker._allocated_blocks),
+                    tracker._computed_blocks,
                 )
 
         logger.debug(

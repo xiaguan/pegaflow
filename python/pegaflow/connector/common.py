@@ -79,8 +79,9 @@ class RequestTracker:
         # Save tracking
         '_total_layers',
         '_saved_layers',
+        # Load tracking
+        '_loaded_blocks',
         # Flags
-        '_load_consumed',
         '_finished',
     )
 
@@ -112,8 +113,10 @@ class RequestTracker:
         self._total_layers = num_layers
         self._saved_layers: int = 0
 
+        # Load tracking
+        self._loaded_blocks: int = 0
+
         # Flags
-        self._load_consumed: bool = False
         self._finished: bool = False
 
     # ========== Properties ==========
@@ -127,7 +130,7 @@ class RequestTracker:
         """
         if not self._lookup_done:
             return RequestPhase.LOOKUP
-        if self._needs_load and not self._load_consumed:
+        if self._needs_load and self._loaded_blocks < self._hit_blocks:
             return RequestPhase.LOADING
         if not self._finished:
             return RequestPhase.ACTIVE
@@ -168,7 +171,7 @@ class RequestTracker:
 
     # ========== Intent consumption ==========
     def consume_load_intent(self) -> LoadIntent | None:
-        if self._load_consumed or not self._needs_load:
+        if not self._needs_load:
             return None
 
         num_blocks = min(
@@ -176,13 +179,14 @@ class RequestTracker:
             len(self._allocated_blocks),
             len(self._block_hashes),
         )
-        load_blocks = num_blocks - self._computed_blocks
+        # Only load blocks beyond what we've already loaded
+        start = max(self._computed_blocks, self._loaded_blocks)
+        load_blocks = num_blocks - start
         if load_blocks <= 0:
             return None
 
-        self._load_consumed = True
-        start = self._computed_blocks
         end = start + load_blocks
+        self._loaded_blocks = end
         return LoadIntent(
             block_ids=tuple(self._allocated_blocks[start:end]),
             block_hashes=self._block_hashes[start:end],
@@ -219,8 +223,9 @@ class RequestTracker:
         return (
             f"RequestTracker(id={self.request_id}, phase={self.phase.value}, "
             f"hit={self._hit_blocks}, computed={self._computed_blocks}, "
-            f"allocated={len(self._allocated_blocks)}, stored={self._stored_blocks}, "
-            f"saved_layers={self._saved_layers}/{self._total_layers})")
+            f"allocated={len(self._allocated_blocks)}, loaded={self._loaded_blocks}, "
+            f"stored={self._stored_blocks}, saved_layers={self._saved_layers}/{self._total_layers})"
+        )
 
 
 class PegaConnectorMetadata(KVConnectorMetadata):
