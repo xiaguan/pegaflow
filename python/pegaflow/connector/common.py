@@ -168,7 +168,6 @@ class RequestTracker:
         self._allocated_blocks = []
 
     def on_alloc(self, block_ids: list[int], num_external_tokens: int) -> None:
-        assert self._load is not None
         self._allocated_blocks.extend(block_ids)
         if self._load is not None:
             self._load.allocated_blocks.extend(block_ids)
