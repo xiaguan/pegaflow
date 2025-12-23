@@ -6,11 +6,12 @@
 //! 2. Send to P node (max_tokens=1)
 //! 3. Forward to D node (P response means KV is ready)
 
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -24,8 +25,18 @@ use clap::Parser;
 use reqwest::Client;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
+use tokio::sync::{Mutex, Notify};
+use tokio::time::timeout;
 use tokio_stream::StreamExt;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+
+const KV_READY_TIMEOUT_MS: u64 = 5_000;
+
+#[derive(Clone, Default)]
+struct KvReadyState {
+    ready: bool,
+    notify: Arc<Notify>,
+}
 
 #[derive(Clone)]
 struct RouterState {
@@ -38,6 +49,8 @@ struct RouterState {
     // Track in-flight requests per node
     p_inflight: Arc<Vec<AtomicUsize>>,
     d_inflight: Arc<Vec<AtomicUsize>>,
+    kv_ready: Arc<Mutex<HashMap<String, KvReadyState>>>,
+    ready_timeout: Duration,
 }
 
 impl RouterState {
@@ -78,6 +91,8 @@ impl RouterState {
             d_index: Arc::new(AtomicUsize::new(0)),
             p_inflight: Arc::new(p_inflight),
             d_inflight: Arc::new(d_inflight),
+            kv_ready: Arc::new(Mutex::new(HashMap::new())),
+            ready_timeout: Duration::from_millis(KV_READY_TIMEOUT_MS),
         }
     }
 
@@ -124,6 +139,60 @@ impl RouterState {
             .collect();
         format!("P={:?} D={:?}", p_counts, d_counts)
     }
+
+    async fn track_request(&self, req_id: &str) -> Arc<Notify> {
+        let mut map = self.kv_ready.lock().await;
+        map.entry(req_id.to_string())
+            .or_insert_with(KvReadyState::default)
+            .notify
+            .clone()
+    }
+
+    async fn mark_kv_ready(&self, req_id: &str) -> bool {
+        let mut map = self.kv_ready.lock().await;
+        if let Some(state) = map.get_mut(req_id) {
+            state.ready = true;
+            state.notify.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn wait_for_kv_ready(&self, req_id: &str) -> bool {
+        {
+            let mut map = self.kv_ready.lock().await;
+            let entry = map
+                .entry(req_id.to_string())
+                .or_insert_with(KvReadyState::default);
+            if entry.ready {
+                map.remove(req_id);
+                return true;
+            }
+            entry.notify.clone()
+        };
+
+        let mut map = self.kv_ready.lock().await;
+        if let Some(state) = map.get(req_id) {
+            if state.ready {
+                map.remove(req_id);
+                return true;
+            }
+            let notify = state.notify.clone();
+            drop(map);
+            let notified = timeout(self.ready_timeout, notify.notified()).await.is_ok();
+            let mut map = self.kv_ready.lock().await;
+            map.remove(req_id);
+            notified
+        } else {
+            false
+        }
+    }
+
+    async fn drop_request(&self, req_id: &str) {
+        let mut map = self.kv_ready.lock().await;
+        map.remove(req_id);
+    }
 }
 
 async fn handle_completion(
@@ -140,6 +209,8 @@ async fn handle_completion(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    state.track_request(&req_id).await;
 
     info!(
         "request arrived: req={} inflight=[{}]",
@@ -187,6 +258,7 @@ async fn handle_completion(
         Ok(resp) => resp,
         Err(e) => {
             state.finish_p(p_idx);
+            state.drop_request(&req_id).await;
             error!("P request failed: req={} error={}", req_id, e);
             return (
                 StatusCode::BAD_GATEWAY,
@@ -201,6 +273,7 @@ async fn handle_completion(
         Ok(v) => v,
         Err(e) => {
             state.finish_p(p_idx);
+            state.drop_request(&req_id).await;
             error!("P response parse failed: req={} error={}", req_id, e);
             return (
                 StatusCode::BAD_GATEWAY,
@@ -218,6 +291,7 @@ async fn handle_completion(
             "P error: req={} status={} body={:?}",
             req_id, p_status, p_result
         );
+        state.drop_request(&req_id).await;
         return (p_status, Json(p_result)).into_response();
     }
 
@@ -229,6 +303,26 @@ async fn handle_completion(
         prefill_latency,
         state.get_inflight_summary()
     );
+
+    let wait_start = Instant::now();
+    let kv_ready = state.wait_for_kv_ready(&req_id).await;
+    let wait_ms = wait_start.elapsed().as_millis();
+    if kv_ready {
+        info!(
+            "kv ready: req={} waited={}ms inflight=[{}]",
+            req_id,
+            wait_ms,
+            state.get_inflight_summary()
+        );
+    } else {
+        warn!(
+            "kv ready timeout: req={} waited={}ms (timeout={}ms) inflight=[{}]",
+            req_id,
+            wait_ms,
+            KV_READY_TIMEOUT_MS,
+            state.get_inflight_summary()
+        );
+    }
 
     // Prepare D request (restore original settings)
     let mut d_body = body;
@@ -366,6 +460,31 @@ async fn completions(state: State<RouterState>, headers: HeaderMap, body: Json<V
     handle_completion(state, headers, body, "/v1/completions").await
 }
 
+async fn kv_ready(State(state): State<RouterState>, Json(body): Json<Value>) -> Response {
+    let Some(req_id) = body
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "missing request_id"})),
+        )
+            .into_response();
+    };
+
+    if state.mark_kv_ready(&req_id).await {
+        info!("kv ready callback: req={}", req_id);
+    } else {
+        warn!(
+            "kv ready callback with no waiter (maybe timed out): req={}",
+            req_id
+        );
+    }
+
+    (StatusCode::OK, Json(json!({"request_id": req_id}))).into_response()
+}
+
 #[derive(Parser)]
 #[command(name = "pegaflow-router")]
 #[command(about = "PegaFlow P/D Disaggregation Router")]
@@ -403,6 +522,7 @@ async fn main() {
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
+        .route("/kv_ready", post(kv_ready))
         .with_state(state);
 
     let addr = format!("{}:{}", args.host, args.port);

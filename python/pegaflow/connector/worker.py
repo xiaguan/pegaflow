@@ -12,7 +12,12 @@ from typing import Any, TYPE_CHECKING
 
 import torch
 
-from pegaflow.connector.common import ConnectorContext, PegaConnectorMetadata, logger
+from pegaflow.connector.common import (
+    ConnectorContext,
+    PegaConnectorMetadata,
+    notify_router_kv_ready,
+    logger,
+)
 from pegaflow.logging_utils import timing_wrapper
 from pegaflow.ipc_wrapper import CudaIPCWrapper
 from pegaflow.pegaflow import PyLoadState
@@ -446,6 +451,7 @@ class WorkerConnector:
                 layer_count,
                 suffix,
             )
+            notify_router_kv_ready(req_id)
 
 
 __all__ = ["WorkerConnector"]

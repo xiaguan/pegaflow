@@ -7,7 +7,9 @@ import hashlib
 import os
 import uuid
 from dataclasses import dataclass, field
+from typing import Final
 
+import requests
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 
 from pegaflow.logging_utils import get_connector_logger
@@ -18,6 +20,8 @@ logger = get_connector_logger()
 # Engine server endpoint (gRPC URL)
 ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT",
                                  "http://127.0.0.1:50055")
+# Router endpoint for P/D disaggregation callback
+ROUTER_ENDPOINT: Final | None = os.environ.get("PEGAFLOW_ROUTER_ENDPOINT")
 
 
 @dataclass(frozen=True)
@@ -303,6 +307,29 @@ __all__ = [
     "RequestTracker",
     "SaveIntent",
     "derive_namespace",
+    "notify_router_kv_ready",
     "logger",
     "resolve_instance_id",
 ]
+
+
+def notify_router_kv_ready(request_id: str) -> None:
+    """Notify router that KV save for a request has completed."""
+    if not ROUTER_ENDPOINT:
+        return
+
+    url = f"{ROUTER_ENDPOINT.rstrip('/')}/kv_ready"
+    try:
+        resp = requests.post(url, json={"request_id": request_id}, timeout=1.0)
+        if resp.status_code >= 400:
+            logger.warning(
+                "[PegaKVConnector] Router callback failed: req=%s status=%s",
+                request_id,
+                resp.status_code,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[PegaKVConnector] Router callback exception for req=%s: %s",
+            request_id,
+            exc,
+        )

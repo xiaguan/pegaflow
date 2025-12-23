@@ -25,6 +25,9 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: Implementation :: CPython",
 ]
+dependencies = [
+    "requests>=2.31",
+]
 
 [tool.maturin]
 # The Rust extension module will be named pegaflow.pegaflow
@@ -32,4 +35,3 @@ classifiers = [
 module-name = "pegaflow.pegaflow"
 python-source = "."
 features = ["pyo3/extension-module"]
-
