@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CUDA_VERSION: '12.8.1'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: ${{ env.CUDA_VERSION }}
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc", "nvrtc-dev", "cudart-dev"]'
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build wheel
+        run: |
+          cd python
+          maturin build --release --out ../dist
+        env:
+          CUDA_PATH: /usr/local/cuda
+
+      - name: Generate Python version tag
+        id: generate_tag
+        run: |
+          echo "python_tag=py${{ matrix.python-version }}" | tr -d '.' >> $GITHUB_OUTPUT
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pegaflow-wheel-${{ steps.generate_tag.outputs.python_tag }}
+          path: dist/*.whl
+
+  publish-release:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p dist-release
+          find dist-all -name "*.whl" -exec cp {} dist-release/ \;
+          echo "Collected wheels:"
+          ls -la dist-release/
+
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/*.whl
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-release/
