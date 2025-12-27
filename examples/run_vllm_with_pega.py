@@ -7,6 +7,7 @@ Usage:
     python run_vllm_with_pega.py --model meta-llama/Llama-3.1-8B --port 8000
     python run_vllm_with_pega.py --model gpt2 --kv-events  # Enable KV events publishing
 """
+
 import argparse
 import json
 import subprocess
@@ -79,14 +80,20 @@ def main():
 
     # Build vllm serve command
     cmd = [
-        "vllm", "serve",
+        "vllm",
+        "serve",
         args.model,
-        "--host", args.host,
-        "--port", str(args.port),
-        "--tensor-parallel-size", str(args.tensor_parallel_size),
-        "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--tensor-parallel-size",
+        str(args.tensor_parallel_size),
+        "--gpu-memory-utilization",
+        str(args.gpu_memory_utilization),
         "--trust-remote-code",
-        "--kv-transfer-config", json.dumps(kv_transfer_config),
+        "--kv-transfer-config",
+        json.dumps(kv_transfer_config),
     ]
 
     # KV events requires prefix caching to be enabled
@@ -103,14 +110,18 @@ def main():
     else:
         cmd.append("--no-enable-prefix-caching")
 
-    print(f"Starting vLLM server with PegaFlow...")
+    print("Starting vLLM server with PegaFlow...")
     print(f"Model: {args.model}")
     print(f"Endpoint: http://{args.host}:{args.port}")
     print(f"Tensor Parallel Size: {args.tensor_parallel_size}")
     if args.kv_events:
-        print(f"Prefix Caching: enabled (required for KV events)")
-        print(f"KV Events: enabled (zmq://localhost:{args.kv_events_port}, topic: {args.kv_events_topic})")
-        print(f"           Monitor with: python monitor_kv_events.py --endpoint tcp://localhost:{args.kv_events_port} --topic {args.kv_events_topic}")
+        print("Prefix Caching: enabled (required for KV events)")
+        print(
+            f"KV Events: enabled (zmq://localhost:{args.kv_events_port}, topic: {args.kv_events_topic})"
+        )
+        print(
+            f"           Monitor with: python monitor_kv_events.py --endpoint tcp://localhost:{args.kv_events_port} --topic {args.kv_events_topic}"
+        )
     print(f"\nCommand: {' '.join(cmd)}\n")
 
     try:

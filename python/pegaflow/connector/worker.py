@@ -37,9 +37,9 @@ class WorkerConnector:
         self._ctx = context
 
         self._save_queue = queue.Queue()
-        self._save_thread = threading.Thread(target=self._save_worker,
-                                             daemon=True,
-                                             name="PegaSaveWorker")
+        self._save_thread = threading.Thread(
+            target=self._save_worker, daemon=True, name="PegaSaveWorker"
+        )
         self._save_thread.start()
 
         self._req_pending_layers: dict[str, int] = {}
@@ -68,15 +68,19 @@ class WorkerConnector:
 
         if self._ctx.tp_rank == 0:
             ok, message = self._ctx.engine_client.unregister_context(
-                self._ctx.instance_id)
+                self._ctx.instance_id
+            )
             if not ok:
                 logger.warning(
-                    "[PegaKVConnector] Unregister context failed: %s", message)
+                    "[PegaKVConnector] Unregister context failed: %s", message
+                )
 
         self._registered_layers.clear()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
-        assert self._ctx.device_id is not None, "CUDA device id is unknown; cannot register KV caches"
+        assert (
+            self._ctx.device_id is not None
+        ), "CUDA device id is unknown; cannot register KV caches"
 
         self._registered_layers = list(kv_caches.keys())
 
@@ -86,8 +90,9 @@ class WorkerConnector:
 
         layout = "unknown"
         for layer_name, kv_cache in kv_caches.items():
-            assert kv_cache.storage_offset(
-            ) == 0, f"KV cache for {layer_name} must have zero storage offset"
+            assert (
+                kv_cache.storage_offset() == 0
+            ), f"KV cache for {layer_name} must have zero storage offset"
 
             wrapper = CudaIPCWrapper(kv_cache)
             wrapper_bytes = pickle.dumps(wrapper)
@@ -109,7 +114,9 @@ class WorkerConnector:
                 segments = 1
                 layout = "blocks-first"
 
-            assert bytes_per_block != 0, f"Invalid bytes_per_block for {layer_name}: stride={stride}"
+            assert (
+                bytes_per_block != 0
+            ), f"Invalid bytes_per_block for {layer_name}: stride={stride}"
 
             ok, message = self._ctx.engine_client.register_context(
                 self._ctx.instance_id,
@@ -128,7 +135,8 @@ class WorkerConnector:
 
             if not ok:
                 raise RuntimeError(
-                    f"Register context failed for {layer_name}: {message}")
+                    f"Register context failed for {layer_name}: {message}"
+                )
 
         logger.info(
             "[PegaKVConnector] Registered %d KV cache layers (%s layout) instance=%s",
@@ -138,24 +146,25 @@ class WorkerConnector:
         )
 
     def get_finished(
-            self, finished_req_ids: set[str]
+        self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
         finished_sending: set[str] | None = None
         finished_recving: set[str] | None = None
 
         with self._save_completion_lock:
             # 1. Add newly finished requests (if they have pending saves) to tracking
-            self._finished_requests.update(finished_req_ids & self._req_pending_layers.keys())
+            self._finished_requests.update(
+                finished_req_ids & self._req_pending_layers.keys()
+            )
             # 2. Identify requests whose saves have completed
             done_saves = self._completed_saves & self._finished_requests
             done_saves.update(self._completed_saves & finished_req_ids)
-            
+
             if done_saves:
                 # 3. Clean up completed requests
                 self._completed_saves -= done_saves
                 self._finished_requests -= done_saves
                 finished_sending = done_saves
-            
 
         with self._load_completion_lock:
             completed_reqs: set[str] = set()
@@ -205,9 +214,12 @@ class WorkerConnector:
         return (finished_sending, finished_recving)
 
     @timing_wrapper
-    def start_load_kv(self, metadata: PegaConnectorMetadata,
-                      forward_context: "ForwardContext",
-                      **kwargs: Any) -> None:
+    def start_load_kv(
+        self,
+        metadata: PegaConnectorMetadata,
+        forward_context: "ForwardContext",
+        **kwargs: Any,
+    ) -> None:
         self._current_save_intents = set(metadata.save_intents.keys())
 
         if not metadata.load_intents:
@@ -230,7 +242,7 @@ class WorkerConnector:
 
         target_layers: list[str] = []
         for layer_name, layer in forward_context.no_compile_layers.items():
-            if hasattr(layer, 'kv_cache'):
+            if hasattr(layer, "kv_cache"):
                 target_layers.append(layer_name)
 
         if not target_layers:
@@ -291,15 +303,16 @@ class WorkerConnector:
         with self._save_completion_lock:
             for req_id in request_ids:
                 if req_id not in self._req_pending_layers:
-                    self._req_pending_layers[req_id] = len(
-                        self._registered_layers)
+                    self._req_pending_layers[req_id] = len(self._registered_layers)
 
-        self._save_queue.put(SaveTask(
-            layer_name=layer_name,
-            attn_metadata=attn_metadata,
-            metadata=metadata,
-            request_ids=request_ids,
-        ))
+        self._save_queue.put(
+            SaveTask(
+                layer_name=layer_name,
+                attn_metadata=attn_metadata,
+                metadata=metadata,
+                request_ids=request_ids,
+            )
+        )
 
     @timing_wrapper
     def wait_for_save(self) -> None:
@@ -326,8 +339,7 @@ class WorkerConnector:
                 len(skipped_requests),
                 skipped_requests,
             )
-            self._handle_save_completion(skipped_requests,
-                                         reason="CUDA graph skip")
+            self._handle_save_completion(skipped_requests, reason="CUDA graph skip")
 
     def _save_worker(self) -> None:
         logger.info("[PegaKVConnector] Save worker thread started")
@@ -382,8 +394,9 @@ class WorkerConnector:
             # Otherwise we may copy uninitialized memory (attention kernel is async)
             torch.cuda.synchronize()
 
-            saves_list = [(name, ids, hashes)
-                          for name, (ids, hashes) in saves_by_layer.items()]
+            saves_list = [
+                (name, ids, hashes) for name, (ids, hashes) in saves_by_layer.items()
+            ]
 
             try:
                 ok, message = self._ctx.engine_client.save(
@@ -420,8 +433,9 @@ class WorkerConnector:
             for req_id in request_ids:
                 if req_id in self._req_pending_layers:
                     self._req_pending_layers[req_id] -= 1
-                    assert self._req_pending_layers[req_id] >= 0, \
-                        f"Layer count mismatch for request {req_id}: counter went negative"
+                    assert (
+                        self._req_pending_layers[req_id] >= 0
+                    ), f"Layer count mismatch for request {req_id}: counter went negative"
 
                     if self._req_pending_layers[req_id] == 0:
                         self._completed_saves.add(req_id)
@@ -430,9 +444,9 @@ class WorkerConnector:
 
         self._handle_save_completion(completed_reqs)
 
-    def _handle_save_completion(self,
-                                request_ids: Iterable[str],
-                                reason: str | None = None) -> None:
+    def _handle_save_completion(
+        self, request_ids: Iterable[str], reason: str | None = None
+    ) -> None:
         req_list = list(request_ids)
         if not req_list:
             return

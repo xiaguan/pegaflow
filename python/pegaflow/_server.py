@@ -2,7 +2,7 @@
 """
 Wrapper script to launch pegaflow-server binary from the installed package.
 """
-import os
+
 import subprocess
 import sys
 from pathlib import Path
@@ -33,7 +33,10 @@ def main():
         )
         sys.exit(result.returncode)
     except FileNotFoundError:
-        print(f"Error: pegaflow-server-py binary not found at {server_binary}", file=sys.stderr)
+        print(
+            f"Error: pegaflow-server-py binary not found at {server_binary}",
+            file=sys.stderr,
+        )
         print("Please ensure pegaflow is properly installed.", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:

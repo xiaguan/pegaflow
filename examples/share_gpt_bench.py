@@ -6,8 +6,8 @@ Usage:
     python share_gpt_bench.py --model meta-llama/Llama-3.1-8B
     python share_gpt_bench.py --model Qwen/Qwen2.5-7B --num-conversations 50
 """
+
 import argparse
-import json
 import subprocess
 import sys
 import time
@@ -31,12 +31,14 @@ def download_dataset(url: str, output_path: Path):
     try:
         with urllib.request.urlopen(url) as response:
             data = response.read()
-            with open(output_path, 'wb') as f:
+            with open(output_path, "wb") as f:
                 f.write(data)
         print(f"✓ Dataset downloaded to: {output_path}\n")
     except Exception as e:
         print(f"Error downloading dataset: {e}", file=sys.stderr)
-        print("\nYou can manually download the dataset and specify it with --dataset-path")
+        print(
+            "\nYou can manually download the dataset and specify it with --dataset-path"
+        )
         sys.exit(1)
 
 
@@ -51,19 +53,22 @@ def convert_sharegpt_dataset(
         print(f"Converted dataset already exists at: {output_path}")
         return output_path
 
-    print(f"Converting ShareGPT dataset to OpenAI format...")
+    print("Converting ShareGPT dataset to OpenAI format...")
     print(f"  Input:  {input_path}")
     print(f"  Output: {output_path}")
     print(f"  Max items: {max_items}, Seed: {seed}\n")
 
     # Find convert_sharegpt_to_openai.py script
     # Try to find it in vLLM benchmarks directory
-    vllm_bench_dir = Path(__file__).parent.parent.parent / "vllm" / "benchmarks" / "multi_turn"
+    vllm_bench_dir = (
+        Path(__file__).parent.parent.parent / "vllm" / "benchmarks" / "multi_turn"
+    )
     convert_script = vllm_bench_dir / "convert_sharegpt_to_openai.py"
 
     if not convert_script.exists():
         # Try alternative locations
         import shutil
+
         convert_script_path = shutil.which("convert_sharegpt_to_openai.py")
         if convert_script_path:
             convert_script = Path(convert_script_path)
@@ -79,8 +84,10 @@ def convert_sharegpt_dataset(
         str(convert_script),
         str(input_path),
         str(output_path),
-        "--seed", str(seed),
-        "--max-items", str(max_items),
+        "--seed",
+        str(seed),
+        "--max-items",
+        str(max_items),
     ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -98,12 +105,15 @@ def convert_sharegpt_dataset(
 def run_benchmark(args, converted_dataset_path: Path, output_file: Path = None):
     """Run benchmark_serving_multi_turn.py with ShareGPT dataset."""
     # Find benchmark_serving_multi_turn.py script
-    vllm_bench_dir = Path(__file__).parent.parent.parent / "vllm" / "benchmarks" / "multi_turn"
+    vllm_bench_dir = (
+        Path(__file__).parent.parent.parent / "vllm" / "benchmarks" / "multi_turn"
+    )
     benchmark_script = vllm_bench_dir / "benchmark_serving_multi_turn.py"
 
     if not benchmark_script.exists():
         # Try alternative locations
         import shutil
+
         benchmark_script_path = shutil.which("benchmark_serving_multi_turn.py")
         if benchmark_script_path:
             benchmark_script = Path(benchmark_script_path)
@@ -118,12 +128,18 @@ def run_benchmark(args, converted_dataset_path: Path, output_file: Path = None):
     cmd = [
         sys.executable,
         str(benchmark_script),
-        "--input-file", str(converted_dataset_path),
-        "--model", args.model,
-        "--url", url,
-        "--seed", str(args.seed),
-        "--request-rate", str(args.request_rate),
-        "--num-clients", str(args.num_clients),
+        "--input-file",
+        str(converted_dataset_path),
+        "--model",
+        args.model,
+        "--url",
+        url,
+        "--seed",
+        str(args.seed),
+        "--request-rate",
+        str(args.request_rate),
+        "--num-clients",
+        str(args.num_clients),
     ]
 
     # Add optional arguments
@@ -162,7 +178,7 @@ def run_benchmark(args, converted_dataset_path: Path, output_file: Path = None):
         print(f"Benchmark failed with return code {result.returncode}")
         raise RuntimeError(f"Benchmark failed: {args.label}")
 
-    print(f"\n✓ Benchmark complete")
+    print("\n✓ Benchmark complete")
 
 
 def main():
@@ -313,7 +329,9 @@ def main():
 
     try:
         # Run benchmark
-        output_file = run_dir / "conversations_output.json" if args.excel_output else None
+        output_file = (
+            run_dir / "conversations_output.json" if args.excel_output else None
+        )
         run_benchmark(args, converted_dataset_path, output_file)
 
         print(f"\n✓ Results saved to: {run_dir}")
@@ -327,6 +345,7 @@ def main():
     except Exception as e:
         print(f"Error running benchmark: {e}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 

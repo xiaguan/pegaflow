@@ -35,7 +35,6 @@ import requests
 from openai import OpenAI
 
 
-
 class VLLMServer:
     """Context manager for vLLM server lifecycle with PegaFlow connector."""
 
@@ -51,10 +50,14 @@ class VLLMServer:
         self.port = port
         self.log_file = log_file
         self.torch_profile_dir = torch_profile_dir
-        self.health_endpoints = list(health_endpoints) if health_endpoints else [
-            "/health",
-            "/metrics",
-        ]
+        self.health_endpoints = (
+            list(health_endpoints)
+            if health_endpoints
+            else [
+                "/health",
+                "/metrics",
+            ]
+        )
         self.process: Optional[subprocess.Popen] = None
         self.log_handle = None
 
@@ -77,18 +80,23 @@ class VLLMServer:
             "kv_connector_module_path": "pegaflow.connector",
         }
 
-        lmcache_config = {
-            "kv_connector": "LMCacheConnectorV1",
-            "kv_role": "kv_both",
-        }
+        # lmcache_config = {
+        #     "kv_connector": "LMCacheConnectorV1",
+        #     "kv_role": "kv_both",
+        # }
 
         cmd = [
-            "vllm", "serve", self.model,
-            "--port", str(self.port),
+            "vllm",
+            "serve",
+            self.model,
+            "--port",
+            str(self.port),
             "--trust-remote-code",
-            "--max-num-batched-tokens", "65536",
+            "--max-num-batched-tokens",
+            "65536",
             "--no-enable-prefix-caching",
-            "--kv-transfer-config", json.dumps(kv_config),
+            "--kv-transfer-config",
+            json.dumps(kv_config),
         ]
 
         print(f"\n[PegaFlow] Starting vLLM server on port {self.port}")
@@ -97,7 +105,7 @@ class VLLMServer:
         # Redirect output to log file
         if self.log_file:
             print(f"[PegaFlow] Server log: {self.log_file}")
-            self.log_handle = open(self.log_file, 'w')
+            self.log_handle = open(self.log_file, "w")
             self.process = subprocess.Popen(
                 cmd,
                 stdout=self.log_handle,
@@ -178,7 +186,7 @@ class VLLMServer:
 
 def generate_prompt(num_tokens: int, prefix: str = "") -> str:
     """Generate a prompt with approximately num_tokens tokens.
-    
+
     Uses repeated 'hi ' pattern which is roughly 1 token per word.
     """
     # Add prefix to make prompts unique
@@ -189,7 +197,7 @@ def generate_prompt(num_tokens: int, prefix: str = "") -> str:
 
 def send_request(client: OpenAI, model: str, prompt: str, output_len: int) -> dict:
     """Send a completion request and measure timing.
-    
+
     Returns:
         dict with ttft_ms, total_ms, and success status
     """
@@ -330,14 +338,14 @@ def run_benchmark(args) -> dict:
         total_tokens = args.base_len + args.append_len
         expected_ttft = results["warmup"]["ttft_ms"] * (total_tokens / args.base_len)
         actual_ttft = results["test"]["ttft_ms"]
-        
+
         if actual_ttft > 0:
             results["speedup"] = expected_ttft / actual_ttft
             results["expected_ttft_ms"] = expected_ttft
 
     # Save results
     results_file = run_dir / "results.json"
-    with open(results_file, 'w') as f:
+    with open(results_file, "w") as f:
         json.dump(results, f, indent=2)
 
     # Print summary
@@ -346,18 +354,24 @@ def run_benchmark(args) -> dict:
     print("=" * 70)
 
     if results["warmup"]["success"]:
-        print(f"Warmup TTFT:      {results['warmup']['ttft_ms']:>10.2f} ms  (base: {args.base_len} tokens)")
+        print(
+            f"Warmup TTFT:      {results['warmup']['ttft_ms']:>10.2f} ms  (base: {args.base_len} tokens)"
+        )
 
     if results["test"]["success"]:
-        print(f"Test TTFT:        {results['test']['ttft_ms']:>10.2f} ms  (base + {args.append_len} tokens)")
+        print(
+            f"Test TTFT:        {results['test']['ttft_ms']:>10.2f} ms  (base + {args.append_len} tokens)"
+        )
 
     if results.get("expected_ttft_ms"):
-        print(f"Expected TTFT:    {results['expected_ttft_ms']:>10.2f} ms  (if no cache reuse)")
+        print(
+            f"Expected TTFT:    {results['expected_ttft_ms']:>10.2f} ms  (if no cache reuse)"
+        )
 
     if results.get("speedup"):
         print("-" * 70)
         print(f"Layer-wise Speedup: {results['speedup']:.2f}x")
-        
+
         if results["speedup"] > 1.5:
             print("Result: Layer-wise KV cache transfer is effective!")
         elif results["speedup"] > 1.0:
@@ -377,40 +391,34 @@ def main():
         description="Benchmark layer-wise KV cache transfer benefit"
     )
     parser.add_argument(
-        "--model",
-        type=str,
-        required=True,
-        help="Model path or identifier"
+        "--model", type=str, required=True, help="Model path or identifier"
     )
     parser.add_argument(
         "--base-len",
         type=int,
         default=10000,
-        help="Base prompt length in tokens (default: 10000)"
+        help="Base prompt length in tokens (default: 10000)",
     )
     parser.add_argument(
         "--append-len",
         type=int,
         default=1024,
-        help="Additional tokens appended for test request (default: 128)"
+        help="Additional tokens appended for test request (default: 128)",
     )
     parser.add_argument(
         "--output-len",
         type=int,
         default=1,
-        help="Output tokens to generate (default: 1)"
+        help="Output tokens to generate (default: 1)",
     )
     parser.add_argument(
-        "--port",
-        type=int,
-        default=8001,
-        help="vLLM server port (default: 8001)"
+        "--port", type=int, default=8001, help="vLLM server port (default: 8001)"
     )
     parser.add_argument(
         "--output-dir",
         type=str,
         default="examples/bench_results",
-        help="Results directory (default: examples/bench_results)"
+        help="Results directory (default: examples/bench_results)",
     )
 
     args = parser.parse_args()

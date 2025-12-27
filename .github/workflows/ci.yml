@@ -83,6 +83,17 @@ jobs:
           cargo clippy -p pegaflow-server --all-targets -- -D warnings
       # Skip python package clippy for now (requires CUDA)
 
+  ruff-check:
+    name: ruff check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run ruff check
+        uses: astral-sh/ruff-action@v3
+
   cargo-check:
     name: cargo check
     runs-on: ubuntu-latest

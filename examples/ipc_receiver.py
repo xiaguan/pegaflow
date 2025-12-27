@@ -65,7 +65,7 @@ def main():
     ipc_wrapper = pickle.loads(data)
     print("  ✓ IPC wrapper deserialized!")
 
-    print(f"\n[Receiver] Step 3: IPC wrapper info:")
+    print("\n[Receiver] Step 3: IPC wrapper info:")
     print(f"  Shape: {ipc_wrapper.shape}")
     print(f"  Dtype: {ipc_wrapper.dtype}")
     print(f"  Device: {ipc_wrapper.device}")
@@ -78,7 +78,7 @@ def main():
     try:
         tensor = ipc_wrapper.to_tensor()
 
-        print(f"  ✓ Tensor reconstructed!")
+        print("  ✓ Tensor reconstructed!")
         print(f"  Tensor shape: {tensor.shape}")
         print(f"  Tensor device: {tensor.device}")
         print(f"  Tensor dtype: {tensor.dtype}")
@@ -88,8 +88,10 @@ def main():
         print("\n[Receiver] Step 5: Verifying tensor data (PyTorch)...")
         print(f"  Received tensor: {tensor}")
 
-        expected = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-                               device=f"cuda:{ipc_wrapper.device}")
+        expected = torch.tensor(
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            device=f"cuda:{ipc_wrapper.device}",
+        )
 
         if torch.allclose(tensor, expected):
             print("  ✓ SUCCESS: Data matches expected values!")
@@ -105,7 +107,7 @@ def main():
         size_bytes = tensor.numel() * tensor.element_size()
 
         gpu_mem = GpuMemory(data_ptr, size_bytes)
-        print(f"  ✓ GpuMemory handle created!")
+        print("  ✓ GpuMemory handle created!")
         print(f"  Data pointer: 0x{gpu_mem.data_ptr():x}")
         print(f"  Size: {gpu_mem.size_bytes()} bytes")
 
@@ -139,9 +141,10 @@ def main():
             print(f"  Got: {tensor}")
 
     except Exception as e:
-        print(f"  ✗ ERROR: Failed to reconstruct tensor!")
+        print("  ✗ ERROR: Failed to reconstruct tensor!")
         print(f"  Error: {e}")
         import traceback
+
         traceback.print_exc()
 
     # Cleanup
@@ -154,6 +157,5 @@ def main():
     print("=" * 60)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-

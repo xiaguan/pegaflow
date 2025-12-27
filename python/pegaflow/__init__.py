@@ -18,4 +18,10 @@ except ImportError:
 from .connector import PegaKVConnector, KVConnectorRole
 
 __version__ = "0.0.1"
-__all__ = ["PegaEngine", "EngineRpcClient", "PyLoadState", "PegaKVConnector", "KVConnectorRole"]
+__all__ = [
+    "PegaEngine",
+    "EngineRpcClient",
+    "PyLoadState",
+    "PegaKVConnector",
+    "KVConnectorRole",
+]

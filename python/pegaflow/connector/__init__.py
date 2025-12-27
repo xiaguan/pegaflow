@@ -1,7 +1,8 @@
-from __future__ import annotations
 """
 Facade for the PegaFlow vLLM connector, split into scheduler/worker implementations.
 """
+
+from __future__ import annotations
 
 import os
 import torch
@@ -38,8 +39,9 @@ class PegaKVConnector(KVConnectorBase_V1):
         instance_id = resolve_instance_id(vllm_config)
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         namespace = derive_namespace(vllm_config, tp_size)
-        num_layers = getattr(vllm_config.model_config.hf_text_config,
-                             "num_hidden_layers", 0)
+        num_layers = getattr(
+            vllm_config.model_config.hf_text_config, "num_hidden_layers", 0
+        )
         block_size = vllm_config.cache_config.block_size
 
         tp_rank: Optional[int] = None
@@ -51,8 +53,9 @@ class PegaKVConnector(KVConnectorBase_V1):
 
         self._engine_endpoint = ENGINE_ENDPOINT
         engine_client = EngineRpcClient(self._engine_endpoint)
-        logger.info("[PegaKVConnector] Connected to engine server at %s",
-                    self._engine_endpoint)
+        logger.info(
+            "[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint
+        )
 
         self._ctx = ConnectorContext(
             instance_id=instance_id,
@@ -112,8 +115,9 @@ class PegaKVConnector(KVConnectorBase_V1):
         metadata = self._get_connector_metadata()
         if metadata is None:
             return
-        self._worker.save_kv_layer(metadata, layer_name, kv_layer,
-                                   attn_metadata, **kwargs)
+        self._worker.save_kv_layer(
+            metadata, layer_name, kv_layer, attn_metadata, **kwargs
+        )
 
     @timing_wrapper
     def wait_for_save(self) -> None:
@@ -122,7 +126,7 @@ class PegaKVConnector(KVConnectorBase_V1):
         self._worker.wait_for_save()
 
     def get_finished(
-            self, finished_req_ids: set[str]
+        self, finished_req_ids: set[str]
     ) -> tuple[set[str] | None, set[str] | None]:
         if not self._worker:
             return (None, None)
@@ -164,8 +168,7 @@ class PegaKVConnector(KVConnectorBase_V1):
     ) -> Tuple[Optional[int], bool]:
         if not self._scheduler:
             return (0, False)
-        return self._scheduler.get_num_new_matched_tokens(
-            request, num_computed_tokens)
+        return self._scheduler.get_num_new_matched_tokens(request, num_computed_tokens)
 
     @timing_wrapper
     def update_state_after_alloc(
@@ -176,7 +179,8 @@ class PegaKVConnector(KVConnectorBase_V1):
     ) -> None:
         if self._scheduler:
             self._scheduler.update_state_after_alloc(
-                request, blocks, num_external_tokens)
+                request, blocks, num_external_tokens
+            )
 
     @timing_wrapper
     def build_connector_meta(self, scheduler_output) -> PegaConnectorMetadata:
@@ -232,4 +236,4 @@ def _resolve_device_id() -> int:
         return local_id
 
 
-__all__ = ["PegaKVConnector", "KVConnectorRole"]
+__all__ = ["PegaKVConnector", "KVConnectorRole", "RequestPhase", "RequestTracker"]
