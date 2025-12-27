@@ -13,6 +13,7 @@ Usage:
 
 Note: Start PegaEngine server separately before running this script.
 """
+
 import argparse
 import json
 import os
@@ -29,7 +30,9 @@ def get_gpu_count() -> int:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
-            capture_output=True, text=True, check=True
+            capture_output=True,
+            text=True,
+            check=True,
         )
         return len(result.stdout.strip().split("\n"))
     except Exception:
@@ -102,7 +105,14 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_vllm_cmd(model: str, port: int, tp_size: int, gpu_util: float, is_prefill: bool, router_endpoint: str) -> list[str]:
+def build_vllm_cmd(
+    model: str,
+    port: int,
+    tp_size: int,
+    gpu_util: float,
+    is_prefill: bool,
+    router_endpoint: str,
+) -> list[str]:
     """Build vllm serve command."""
     kv_transfer_config = {
         "kv_connector": "PegaKVConnector",
@@ -111,15 +121,21 @@ def build_vllm_cmd(model: str, port: int, tp_size: int, gpu_util: float, is_pref
     }
 
     cmd = [
-        "vllm", "serve",
+        "vllm",
+        "serve",
         model,
-        "--host", "0.0.0.0",
-        "--port", str(port),
-        "--tensor-parallel-size", str(tp_size),
-        "--gpu-memory-utilization", str(gpu_util),
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+        "--tensor-parallel-size",
+        str(tp_size),
+        "--gpu-memory-utilization",
+        str(gpu_util),
         "--trust-remote-code",
         "--no-enable-prefix-caching",
-        "--kv-transfer-config", json.dumps(kv_transfer_config),
+        "--kv-transfer-config",
+        json.dumps(kv_transfer_config),
     ]
 
     return cmd
@@ -142,7 +158,10 @@ def main():
         sys.exit(1)
 
     if required_gpus > gpu_count:
-        print(f"Error: Need {required_gpus} GPUs ({args.num_p}P + {args.num_d}D, TP={tp_size}), but only {gpu_count} available", file=sys.stderr)
+        print(
+            f"Error: Need {required_gpus} GPUs ({args.num_p}P + {args.num_d}D, TP={tp_size}), but only {gpu_count} available",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # Allocate GPUs: P nodes first, then D nodes
@@ -191,8 +210,12 @@ def main():
     signal.signal(signal.SIGTERM, cleanup)
 
     # Compute endpoints
-    p_endpoints = [f"http://localhost:{args.p_base_port + i}" for i in range(args.num_p)]
-    d_endpoints = [f"http://localhost:{args.d_base_port + i}" for i in range(args.num_d)]
+    p_endpoints = [
+        f"http://localhost:{args.p_base_port + i}" for i in range(args.num_p)
+    ]
+    d_endpoints = [
+        f"http://localhost:{args.d_base_port + i}" for i in range(args.num_d)
+    ]
     router_endpoint = f"http://localhost:{args.router_port}"
 
     print("=" * 60)
@@ -221,8 +244,12 @@ def main():
     for i in range(args.num_p):
         port = args.p_base_port + i
         cmd = build_vllm_cmd(
-            args.model, port, args.tensor_parallel_size,
-            args.gpu_memory_utilization, is_prefill=True, router_endpoint=router_endpoint
+            args.model,
+            port,
+            args.tensor_parallel_size,
+            args.gpu_memory_utilization,
+            is_prefill=True,
+            router_endpoint=router_endpoint,
         )
 
         env = base_env.copy()
@@ -237,9 +264,11 @@ def main():
         if run_dir:
             log_file = run_dir / f"prefill_{i}.log"
             print(f"[P{i}] Log file: {log_file}")
-            log_handle = open(log_file, 'w')
+            log_handle = open(log_file, "w")
             log_handles.append(log_handle)
-            p = subprocess.Popen(cmd, env=env, stdout=log_handle, stderr=subprocess.STDOUT)
+            p = subprocess.Popen(
+                cmd, env=env, stdout=log_handle, stderr=subprocess.STDOUT
+            )
         else:
             p = subprocess.Popen(cmd, env=env)
         processes.append(p)
@@ -248,8 +277,12 @@ def main():
     for i in range(args.num_d):
         port = args.d_base_port + i
         cmd = build_vllm_cmd(
-            args.model, port, args.tensor_parallel_size,
-            args.gpu_memory_utilization, is_prefill=False, router_endpoint=router_endpoint
+            args.model,
+            port,
+            args.tensor_parallel_size,
+            args.gpu_memory_utilization,
+            is_prefill=False,
+            router_endpoint=router_endpoint,
         )
 
         env = base_env.copy()
@@ -263,9 +296,11 @@ def main():
         if run_dir:
             log_file = run_dir / f"decode_{i}.log"
             print(f"[D{i}] Log file: {log_file}")
-            log_handle = open(log_file, 'w')
+            log_handle = open(log_file, "w")
             log_handles.append(log_handle)
-            p = subprocess.Popen(cmd, env=env, stdout=log_handle, stderr=subprocess.STDOUT)
+            p = subprocess.Popen(
+                cmd, env=env, stdout=log_handle, stderr=subprocess.STDOUT
+            )
         else:
             p = subprocess.Popen(cmd, env=env)
         processes.append(p)
@@ -279,11 +314,20 @@ def main():
     project_root = Path(__file__).parent.parent.resolve()
 
     router_cmd = [
-        "cargo", "run", "--release", "--bin", "pegaflow-router", "--",
-        "--host", "0.0.0.0",
-        "--port", str(args.router_port),
-        "--prefill", *p_endpoints,
-        "--decode", *d_endpoints,
+        "cargo",
+        "run",
+        "--release",
+        "--bin",
+        "pegaflow-router",
+        "--",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(args.router_port),
+        "--prefill",
+        *p_endpoints,
+        "--decode",
+        *d_endpoints,
     ]
 
     print(f"\n[Router] Starting Rust pegaflow-router on port {args.router_port}")
@@ -293,9 +337,15 @@ def main():
     if run_dir:
         log_file = run_dir / "router.log"
         print(f"[Router] Log file: {log_file}")
-        log_handle = open(log_file, 'w')
+        log_handle = open(log_file, "w")
         log_handles.append(log_handle)
-        router_p = subprocess.Popen(router_cmd, cwd=project_root, env=base_env, stdout=log_handle, stderr=subprocess.STDOUT)
+        router_p = subprocess.Popen(
+            router_cmd,
+            cwd=project_root,
+            env=base_env,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
     else:
         router_p = subprocess.Popen(router_cmd, cwd=project_root, env=base_env)
     processes.append(router_p)

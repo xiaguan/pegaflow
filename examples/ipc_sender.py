@@ -12,6 +12,7 @@ import zmq
 import pickle
 import time
 
+
 class CudaIPCWrapper:
     """Wrapper for CUDA IPC handle with tensor metadata."""
 
@@ -43,12 +44,15 @@ def main():
 
     # Initialize CUDA
     torch.cuda.init()
-    device = torch.device('cuda:0')
+    device = torch.device("cuda:0")
 
     # Step 1: Create a GPU tensor with test data
     print("\n[Sender] Step 1: Creating GPU tensor with test data...")
-    tensor = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-                          dtype=torch.float32, device=device)
+    tensor = torch.tensor(
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+        dtype=torch.float32,
+        device=device,
+    )
     print(f"  Tensor: {tensor}")
     print(f"  Shape: {tensor.shape}")
     print(f"  Device: {tensor.device}")
@@ -57,7 +61,7 @@ def main():
     # Step 2: Wrap tensor in IPC wrapper
     print("\n[Sender] Step 2: Creating CUDA IPC wrapper...")
     ipc_wrapper = CudaIPCWrapper(tensor)
-    print(f"  ✓ IPC wrapper created!")
+    print("  ✓ IPC wrapper created!")
     print(f"  Handle type: {type(ipc_wrapper.handle)}")
     print(f"  Handle length: {len(ipc_wrapper.handle)}")
     print(f"  Shape: {ipc_wrapper.shape}")
@@ -96,8 +100,11 @@ def main():
 
         # Check tensor value every second
         current_value = tensor.clone()
-        expected_original = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-                                        dtype=torch.float32, device=device)
+        expected_original = torch.tensor(
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            dtype=torch.float32,
+            device=device,
+        )
         expected_modified = expected_original * 2.0
 
         # Check if tensor was modified by receiver
@@ -110,7 +117,9 @@ def main():
 
         # Print status every 5 seconds
         if i % 5 == 0:
-            print(f"  ... {30 - i} seconds remaining (tensor: {tensor[:3].tolist()}...)")
+            print(
+                f"  ... {30 - i} seconds remaining (tensor: {tensor[:3].tolist()}...)"
+            )
 
     # Final check
     print(f"\n[Sender] Final tensor value: {tensor}")
@@ -129,6 +138,5 @@ def main():
     print("=" * 60)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-

@@ -87,7 +87,8 @@ class SchedulerConnector:
         if tracker is None:
             logger.warning(
                 "[PegaKVConnector] No tracker for request %s in update_state_after_alloc",
-                req_id)
+                req_id,
+            )
             return
 
         block_ids = list(blocks.get_block_ids()[0]) if blocks else []
@@ -115,7 +116,8 @@ class SchedulerConnector:
 
     @timing_wrapper
     def build_connector_meta(
-            self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
+        self, scheduler_output: "SchedulerOutput"
+    ) -> PegaConnectorMetadata:
         save_intents: dict[str, SaveIntent] = {}
 
         load_intents = self._pending_load_intents
@@ -164,8 +166,7 @@ class SchedulerConnector:
             save_intents=save_intents,
         )
 
-    def update_connector_output(self,
-                                connector_output: "KVConnectorOutput") -> None:
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
         for req_id in connector_output.finished_sending or []:
             tracker = self._trackers.get(req_id)
             if tracker:
@@ -179,8 +180,7 @@ class SchedulerConnector:
 
                 if tracker.is_done():
                     del self._trackers[req_id]
-                    logger.debug(
-                        "[PegaKVConnector] Cleaned up tracker for %s", req_id)
+                    logger.debug("[PegaKVConnector] Cleaned up tracker for %s", req_id)
 
     def request_finished(
         self,
@@ -216,7 +216,8 @@ class SchedulerConnector:
 
     def _count_available_block_prefix(self, block_hashes: Iterable[bytes]) -> int:
         ok, message, hit_blocks = self._ctx.engine_client.query(
-            self._ctx.instance_id, list(block_hashes))
+            self._ctx.instance_id, list(block_hashes)
+        )
         if not ok:
             raise RuntimeError(f"Query failed: {message}")
         return hit_blocks

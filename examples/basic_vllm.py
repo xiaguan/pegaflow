@@ -5,31 +5,52 @@ This example demonstrates:
 1. First run: Generate text and save KV cache to CPU
 2. Second run: Generate same prompt again and load KV cache from CPU
 """
+
 from vllm import LLM, SamplingParams
 from vllm.config import KVTransferConfig
 import time
 
 import random
 
+
 def generate_long_prompt(length: int) -> str:
     """Randomly generate a prompt string with (at least) the given length."""
     words = [
-        "apple", "banana", "orange", "kiwi", "mango", "grape",
-        "quantum", "tensor", "network", "compute", "memory",
-        "rdma", "cache", "pega", "flow", "mooncake", "nvlink",
-        "distributed", "system", "prefill", "decode", "chunk",
+        "apple",
+        "banana",
+        "orange",
+        "kiwi",
+        "mango",
+        "grape",
+        "quantum",
+        "tensor",
+        "network",
+        "compute",
+        "memory",
+        "rdma",
+        "cache",
+        "pega",
+        "flow",
+        "mooncake",
+        "nvlink",
+        "distributed",
+        "system",
+        "prefill",
+        "decode",
+        "chunk",
     ]
-    
+
     parts = []
     total_len = 0
 
     while total_len < length:
         w = random.choice(words)
         parts.append(w)
-        total_len += len(w) + 1 
+        total_len += len(w) + 1
 
     full = " ".join(parts)
     return full[:length]
+
 
 def real_long_prompt() -> str:
     return (
@@ -55,10 +76,11 @@ def real_long_prompt() -> str:
         "to create additional length for stress testing."
     )
 
+
 def main():
-    print("="*70)
+    print("=" * 70)
     print("PegaFlow KV Cache Test - Save and Load")
-    print("="*70)
+    print("=" * 70)
 
     # Configure vLLM to use our PegaKVConnector
     kv_transfer_config = KVTransferConfig(
@@ -92,9 +114,9 @@ def main():
     )
 
     # First run: Generate and save KV cache
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("[2/4] First run - Generating text (will save KV cache to CPU)...")
-    print("="*70)
+    print("=" * 70)
     start_time = time.time()
     outputs = llm.generate([prompt], sampling_params)
     first_run_time = time.time() - start_time
@@ -106,9 +128,9 @@ def main():
     print(f"Time: {first_run_time:.3f}s")
 
     # Second run: Same prompt, should load from CPU cache
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("[3/4] Second run - Same prompt (should load KV cache from CPU)...")
-    print("="*70)
+    print("=" * 70)
     start_time = time.time()
     outputs = llm.generate([prompt], sampling_params)
     second_run_time = time.time() - start_time
@@ -120,9 +142,9 @@ def main():
     print(f"Time: {second_run_time:.3f}s")
 
     # Compare results
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("[4/4] Results Summary")
-    print("="*70)
+    print("=" * 70)
     print(f"First run time:  {first_run_time:.3f}s")
     print(f"Second run time: {second_run_time:.3f}s")
 
@@ -131,10 +153,10 @@ def main():
     else:
         print("✗ Outputs differ (unexpected)")
 
-    print("\n" + "="*70)
+    print("\n" + "=" * 70)
     print("Test completed!")
-    print("="*70)
+    print("=" * 70)
+
 
 if __name__ == "__main__":
     main()
-

@@ -41,6 +41,7 @@ def timing_wrapper(func):
 
     Enable by setting environment variable: PEGAFLOW_ENABLE_TIMING=1
     """
+
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         if not ENABLE_TIMING:
@@ -55,6 +56,7 @@ def timing_wrapper(func):
             elapsed_ms,
         )
         return result
+
     return wrapper
 
 

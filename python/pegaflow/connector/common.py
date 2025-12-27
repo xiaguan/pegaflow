@@ -16,13 +16,13 @@ from pegaflow.pegaflow import EngineRpcClient
 logger = get_connector_logger()
 
 # Engine server endpoint (gRPC URL)
-ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT",
-                                 "http://127.0.0.1:50055")
+ENGINE_ENDPOINT = os.environ.get("PEGAFLOW_ENGINE_ENDPOINT", "http://127.0.0.1:50055")
 
 
 @dataclass(frozen=True)
 class ConnectorContext:
     """Shared configuration for scheduler/worker connectors."""
+
     instance_id: str
     namespace: str
     block_size: int
@@ -35,6 +35,7 @@ class ConnectorContext:
 
 class RequestPhase(enum.Enum):
     """Lifecycle phase of a request in the KV connector."""
+
     LOOKUP = "lookup"  # Waiting for lookup result from external storage
     LOADING = "loading"  # Need to load KV from external storage
     ACTIVE = "active"  # Actively generating (may be saving concurrently)
@@ -45,6 +46,7 @@ class RequestPhase(enum.Enum):
 @dataclass(frozen=True)
 class LoadIntent:
     """Intent for a KV load operation."""
+
     block_ids: tuple[int, ...]
     block_hashes: tuple[bytes, ...]
     num_tokens: int
@@ -60,6 +62,7 @@ class LoadState:
     - Updated by on_alloc() with allocated block IDs
     - Consumed by consume_load_intent() which returns LoadIntent and clears state
     """
+
     hit_blocks: int
     computed_blocks: int
     allocated_blocks: list[int] = field(default_factory=list)
@@ -88,8 +91,8 @@ class LoadState:
 
         start = self.computed_blocks
         return LoadIntent(
-            block_ids=tuple(self.allocated_blocks[start:start + load_blocks]),
-            block_hashes=block_hashes[start:start + load_blocks],
+            block_ids=tuple(self.allocated_blocks[start : start + load_blocks]),
+            block_hashes=block_hashes[start : start + load_blocks],
             num_tokens=load_blocks * block_size,
         )
 
@@ -97,6 +100,7 @@ class LoadState:
 @dataclass(frozen=True)
 class SaveIntent:
     """Intent for a KV save operation."""
+
     block_ids: tuple[int, ...]
     block_hashes: tuple[bytes, ...]
 
@@ -113,16 +117,16 @@ class RequestTracker:
     """
 
     __slots__ = (
-        'request_id',
-        '_block_hashes',
-        '_block_size',
-        '_load',
-        '_allocated_blocks',
-        '_scheduled_tokens',
-        '_stored_blocks',
-        '_total_layers',
-        '_saved_layers',
-        '_finished',
+        "request_id",
+        "_block_hashes",
+        "_block_size",
+        "_load",
+        "_allocated_blocks",
+        "_scheduled_tokens",
+        "_stored_blocks",
+        "_total_layers",
+        "_saved_layers",
+        "_finished",
     )
 
     def __init__(
@@ -201,13 +205,16 @@ class RequestTracker:
         start = self._stored_blocks
         self._stored_blocks = start + new_blocks
         return SaveIntent(
-            block_ids=tuple(self._allocated_blocks[start:self._stored_blocks]),
-            block_hashes=self._block_hashes[start:self._stored_blocks],
+            block_ids=tuple(self._allocated_blocks[start : self._stored_blocks]),
+            block_hashes=self._block_hashes[start : self._stored_blocks],
         )
 
     def should_hold_blocks(self) -> bool:
-        return (self._finished and self._stored_blocks > 0 and
-                self._saved_layers < self._total_layers)
+        return (
+            self._finished
+            and self._stored_blocks > 0
+            and self._saved_layers < self._total_layers
+        )
 
     def is_done(self) -> bool:
         return self.phase == RequestPhase.DONE
@@ -234,8 +241,10 @@ class PegaConnectorMetadata(KVConnectorMetadata):
         self.save_intents: dict[str, SaveIntent] = save_intents or {}
 
     def __repr__(self) -> str:
-        return (f"PegaConnectorMetadata(loads={len(self.load_intents)}, "
-                f"saves={len(self.save_intents)})")
+        return (
+            f"PegaConnectorMetadata(loads={len(self.load_intents)}, "
+            f"saves={len(self.save_intents)})"
+        )
 
 
 def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
@@ -243,17 +252,17 @@ def resolve_instance_id(vllm_config, dp_rank_suffix: bool = True) -> str:
     instance_id = vllm_config.kv_transfer_config.engine_id
     if instance_id:
         logger.info(
-            "[PegaKVConnector] Using kv_transfer_config.engine_id: %s",
-            instance_id)
+            "[PegaKVConnector] Using kv_transfer_config.engine_id: %s", instance_id
+        )
         return instance_id
 
-    instance_id = vllm_config.instance_id or os.environ.get(
-        "PEGAFLOW_INSTANCE_ID", "")
+    instance_id = vllm_config.instance_id or os.environ.get("PEGAFLOW_INSTANCE_ID", "")
     if not instance_id:
         instance_id = uuid.uuid4().hex
         logger.info(
             "[PegaKVConnector] No instance_id from vLLM; generated fallback %s",
-            instance_id)
+            instance_id,
+        )
 
     if dp_rank_suffix:
         parallel_config = vllm_config.parallel_config
