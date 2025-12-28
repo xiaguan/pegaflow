@@ -1327,6 +1327,7 @@ dependencies = [
  "crossbeam",
  "cudarc",
  "hashlink",
+ "libc",
  "offset-allocator",
  "opentelemetry",
  "rand 0.9.2",

@@ -13,8 +13,9 @@ rand.workspace = true
 shared_memory.workspace = true
 uuid.workspace = true
 crossbeam.workspace = true
-opentelemetry.workspace = true  
+opentelemetry.workspace = true
 bytesize.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 criterion.workspace = true
@@ -26,3 +27,6 @@ harness = false
 [[bench]]
 name = "uds_latency"
 harness = false
+
+[[example]]
+name = "pinned_alloc"

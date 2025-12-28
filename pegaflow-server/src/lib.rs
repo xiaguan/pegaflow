@@ -53,6 +53,11 @@ pub struct Cli {
     #[arg(long, default_value = "30gb", value_parser = parse_memory_size)]
     pub pool_size: usize,
 
+    /// Use huge pages for pinned memory pool (faster allocation).
+    /// Requires pre-configured huge pages via /proc/sys/vm/nr_hugepages
+    #[arg(long, default_value_t = false)]
+    pub use_hugepages: bool,
+
     /// Enable OTLP metrics export over gRPC (e.g. http://127.0.0.1:4317). Leave empty to disable.
     #[arg(long, default_value = "http://127.0.0.1:4321")]
     pub metrics_otel_endpoint: Option<String>,
@@ -144,11 +149,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let registry = Arc::new(Mutex::new(registry));
 
     info!(
-        "Creating PegaEngine with pinned memory pool: {:.2} GiB ({} bytes)",
+        "Creating PegaEngine with pinned memory pool: {:.2} GiB ({} bytes), hugepages={}",
         cli.pool_size as f64 / (1024.0 * 1024.0 * 1024.0),
-        cli.pool_size
+        cli.pool_size,
+        cli.use_hugepages
     );
-    let engine = Arc::new(PegaEngine::new_with_pool_size(cli.pool_size));
+    let engine = Arc::new(PegaEngine::new_with_pool_size(
+        cli.pool_size,
+        cli.use_hugepages,
+    ));
     let shutdown = Arc::new(Notify::new());
 
     let service = GrpcEngineService::new(engine, Arc::clone(&registry), Arc::clone(&shutdown));

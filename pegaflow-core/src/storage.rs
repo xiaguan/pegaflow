@@ -297,8 +297,8 @@ pub struct StorageEngine {
 }
 
 impl StorageEngine {
-    pub fn new(capacity_bytes: usize) -> Self {
-        let pinned_pool = Arc::new(PinnedMemoryPool::new(capacity_bytes));
+    pub fn new(capacity_bytes: usize, use_hugepages: bool) -> Self {
+        let pinned_pool = Arc::new(PinnedMemoryPool::new(capacity_bytes, use_hugepages));
         let kv_storage = Mutex::new(LruCache::new_unbounded());
 
         Self {

@@ -1,6 +1,7 @@
 pub mod allocator;
 pub mod gpu_worker;
 mod metrics;
+pub mod pinned_mem;
 pub mod pinned_pool;
 mod storage;
 pub mod sync_state;
@@ -258,15 +259,17 @@ impl Default for PegaEngine {
 }
 
 impl PegaEngine {
-    /// Create a new PegaEngine instance
+    /// Create a new PegaEngine instance with default pool size and regular pages
     #[instrument(level = "info")]
     pub fn new() -> Self {
-        Self::new_with_pool_size(DEFAULT_PINNED_POOL_BYTES)
+        Self::new_with_pool_size(DEFAULT_PINNED_POOL_BYTES, false)
     }
 
     /// Create a new PegaEngine instance with a custom pinned memory pool size
-    pub fn new_with_pool_size(pool_size: usize) -> Self {
-        let storage = StorageEngine::new(pool_size);
+    ///
+    /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
+    pub fn new_with_pool_size(pool_size: usize, use_hugepages: bool) -> Self {
+        let storage = StorageEngine::new(pool_size, use_hugepages);
         PegaEngine {
             instances: RwLock::new(HashMap::new()),
             storage,
