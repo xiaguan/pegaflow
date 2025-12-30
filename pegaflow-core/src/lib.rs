@@ -584,7 +584,17 @@ impl PegaEngine {
             }
 
             // Check if this block_hash already has data for this slot
-            let needs_save = !self.storage.slot_has_block(namespace, block_hash, slot_id);
+            // Skip if already sealed in cache or slot exists in inflight
+            //
+            // FIXME(race): There's a subtle race condition here. If cache contains the block
+            // when checking layer 0 (skip), but gets evicted before checking layer 1 (write),
+            // we create an inflight block with only slot 1 that can never complete.
+            // Probability is near-zero with large pools, but for robustness we should add
+            // a background GC thread to clean up inflight blocks older than ~1 hour.
+            let needs_save = !self.storage.cache_contains(namespace, block_hash)
+                && !self
+                    .storage
+                    .inflight_has_slot(namespace, block_hash, slot_id);
 
             if needs_save {
                 blocks_to_save.push((block_idx, block_hash.clone()));
@@ -668,8 +678,10 @@ impl PegaEngine {
                     Arc::clone(&v_allocation),
                 ));
 
-                self.storage
-                    .insert_block(namespace, block_hash, slot_id, block, total_slots)
+                // Insert slot; ignore the bool (already checked existence above)
+                let _ = self
+                    .storage
+                    .insert_slot(namespace, block_hash, slot_id, block, total_slots)
                     .map_err(|e| EngineError::Storage(e.to_string()))?;
             }
         } else {
@@ -731,8 +743,10 @@ impl PegaEngine {
                     Arc::clone(&allocation),
                 ));
 
-                self.storage
-                    .insert_block(namespace, block_hash, slot_id, block, total_slots)
+                // Insert slot; ignore the bool (already checked existence above)
+                let _ = self
+                    .storage
+                    .insert_slot(namespace, block_hash, slot_id, block, total_slots)
                     .map_err(|e| EngineError::Storage(e.to_string()))?;
             }
         }
@@ -780,7 +794,7 @@ impl PegaEngine {
 
         for block_hash in block_hashes.iter() {
             // Storage engine handles "completion" atomically across all layers and TP ranks
-            if !self.storage.block_is_complete(namespace, block_hash) {
+            if !self.storage.cache_contains(namespace, block_hash) {
                 // Block not complete: cache miss for remaining blocks
                 metrics
                     .cache_block_misses
@@ -871,7 +885,7 @@ impl PegaEngine {
         // Lookup all block_hashes ONCE and cache the blocks
         let block_cache = self
             .storage
-            .lookup_many(namespace, block_hashes)
+            .cache_lookup_many(namespace, block_hashes)
             .map_err(EngineError::Storage)?;
 
         // Build LoadTask with data for all layers
@@ -898,7 +912,7 @@ impl PegaEngine {
                 .zip(block_cache.iter())
                 .filter_map(|(block_id, block_entry)| {
                     let block_idx = usize::try_from(*block_id).ok()?;
-                    let layer_block = block_entry.get_slot(slot_id)?;
+                    let layer_block = block_entry.get_slot(slot_id)?.clone();
                     Some(LoadBlock {
                         block_idx,
                         layer_block,

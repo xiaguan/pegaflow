@@ -13,6 +13,7 @@ rand.workspace = true
 shared_memory.workspace = true
 uuid.workspace = true
 crossbeam.workspace = true
+dashmap.workspace = true
 opentelemetry.workspace = true
 bytesize.workspace = true
 libc = "0.2"

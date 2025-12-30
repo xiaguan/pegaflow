@@ -1,26 +1,19 @@
-use crossbeam::sync::ShardedLock;
 // ============================================================================
-// StorageEngine eviction + layout notes (mirrors the high-level summary in
-// lib.rs):
-// - Allocation is always attempted first; eviction only happens when the pinned
-//   pool cannot satisfy a request (often due to fragmentation at different
-//   utilization levels). On failure we drop a batch of LRU entries and retry.
-// - Eviction is batched (RECLAIM_BATCH_OBJECTS) so a single allocation failure
-//   can free multiple cached objects at once instead of thrashing.
-// - Pre-eviction: A background thread can be enabled to proactively reclaim
-//   blocks when free space drops below a threshold, reducing allocation stalls.
-// - LRU key: BlockHash (Vec<u8> digest for one logical block across layers/TP ranks).
-//   LRU value: Block (stateful set of LayerBlock slots, ordered by flat slot id
-//   slot_id = layer_id * tp_size + tp_rank).
-// - CPU memory picture for one hash (split K/V storage):
-//     BlockHash ->
-//       K range: [slot0 K data][slot1 K data][slot2 K data]...
-//       V range: [slot0 V data][slot1 V data][slot2 V data]...
-//   Slots saved together share one allocation per K and V, so a layer's blocks
-//   sit back-to-back in those ranges. When K/V are co-located, V_ptr is None
-//   and the V bytes follow K in the same allocation.
+// StorageEngine: Two-phase block storage with separate write and read paths.
+//
+// Lifecycle: Allocate → Write (inflight) → Seal → Cache (read-only) → Evict
+//
+// Key invariant: Sealing is a one-way gate. Once sealed, a block is immutable.
+//
+// Architecture:
+// - Inflight: DashMap<BlockKey, Mutex<InflightBlock>> for concurrent writes
+// - Cache: LruCache<BlockKey, Arc<SealedBlock>> for read-only lookup + eviction
+// - Allocator: PinnedMemoryPool for pinned memory allocation
+//
+// Eviction only targets the cache; inflight blocks are never evicted.
 // ============================================================================
 use bytesize::ByteSize;
+use dashmap::DashMap;
 use hashlink::LruCache;
 use std::fmt;
 use std::num::NonZeroU64;
@@ -74,16 +67,11 @@ impl PreEvictConfig {
 // calculated as `layer_id * tp_size + tp_rank`.
 // vLLM/Connectors report the total topology (layers * tp_size) via registration,
 // and this count is immutable for the lifetime of the Instance.
-// NOTE: Storage is generic and operates on flat indices (slots).
 
 /// Key for identifying blocks in storage, including namespace for model isolation.
 ///
 /// NOTE: Using String for namespace is simple but adds ~20-50 bytes overhead per key.
 /// Future optimization: intern namespaces to u32 IDs (saves memory, faster comparison).
-///
-/// TODO: Optimize BlockKey to avoid deep copy on every lookup
-/// Current issue: BlockKey::new creates deep copies of namespace (String) and hash (Vec<u8>)
-/// on every lookup in hot paths (slot_has_block, block_is_complete).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockKey {
     /// Namespace for model isolation (e.g., model name, or empty string for shared storage)
@@ -99,25 +87,20 @@ impl BlockKey {
 }
 
 pub type BlockHash = Vec<u8>;
-type LayerBlockSlots = Vec<Option<Arc<LayerBlock>>>;
 
-/// State machine for a logical block (all layer/TP slots for one hash).
-enum BlockState {
-    /// In-flight, still accepting writes for empty slots.
-    Filling(FillingBlock),
-    /// Fully populated; read-only view.
-    Sealed(SealedBlock),
-}
+// ============================================================================
+// Inflight Block (write path, mutable)
+// ============================================================================
 
-/// Mutable block while we are still receiving layer slots.
-struct FillingBlock {
-    slots: LayerBlockSlots,
+/// Block that is still being written. Internal to StorageEngine.
+struct InflightBlock {
+    slots: Vec<Option<Arc<LayerBlock>>>,
     remaining: usize,
     total_slots: usize,
     footprint: u64,
 }
 
-impl FillingBlock {
+impl InflightBlock {
     fn new(total_slots: usize) -> Self {
         Self {
             slots: vec![None; total_slots],
@@ -127,17 +110,14 @@ impl FillingBlock {
         }
     }
 
-    fn slot_has_block(&self, slot_id: usize) -> bool {
+    fn slot_exists(&self, slot_id: usize) -> bool {
         self.slots
             .get(slot_id)
             .and_then(|opt| opt.as_ref())
             .is_some()
     }
 
-    fn get_slot(&self, slot_id: usize) -> Option<Arc<LayerBlock>> {
-        self.slots.get(slot_id).and_then(|opt| opt.clone())
-    }
-
+    /// Insert a slot. Returns Ok(true) if block is now complete.
     fn insert_slot(
         &mut self,
         slot_id: usize,
@@ -159,7 +139,8 @@ impl FillingBlock {
         }
 
         if self.slots[slot_id].is_some() {
-            return Err(BlockInsertError::SlotAlreadyFilled { slot_id });
+            // Already filled - this is a no-op, not an error
+            return Ok(false);
         }
 
         self.footprint += block.memory_footprint();
@@ -170,124 +151,45 @@ impl FillingBlock {
             .expect("remaining should not underflow");
         Ok(self.remaining == 0)
     }
+
+    /// Seal the block, converting to immutable SealedBlock.
+    /// Panics if not all slots are filled.
+    fn seal(self) -> SealedBlock {
+        let slots: Vec<Arc<LayerBlock>> = self
+            .slots
+            .into_iter()
+            .map(|opt| opt.expect("all slots must be filled before sealing"))
+            .collect();
+        SealedBlock {
+            slots: slots.into(),
+            footprint: self.footprint,
+        }
+    }
 }
 
-/// Immutable view after all slots are filled; no further writes allowed.
-struct SealedBlock {
-    slots: Arc<[Arc<LayerBlock>]>,
+// ============================================================================
+// Sealed Block (read path, immutable)
+// ============================================================================
+
+/// Immutable block after all slots are filled. Exposed to callers.
+pub struct SealedBlock {
+    slots: Box<[Arc<LayerBlock>]>,
     footprint: u64,
 }
 
 impl SealedBlock {
-    fn slot_has_block(&self, slot_id: usize) -> bool {
-        self.slots.get(slot_id).is_some()
+    pub fn get_slot(&self, slot_id: usize) -> Option<&Arc<LayerBlock>> {
+        self.slots.get(slot_id)
     }
 
-    fn get_slot(&self, slot_id: usize) -> Option<Arc<LayerBlock>> {
-        self.slots.get(slot_id).cloned()
-    }
-}
-
-/// State machine for a logical block (all layer/TP slots for one hash).
-impl BlockState {
-    fn insert_slot(
-        &mut self,
-        slot_id: usize,
-        block: Arc<LayerBlock>,
-        total_slots: usize,
-    ) -> Result<(), BlockInsertError> {
-        match self {
-            BlockState::Filling(filling) => {
-                let completed = filling.insert_slot(slot_id, block, total_slots)?;
-                if completed {
-                    let sealed_slots: Vec<Arc<LayerBlock>> = filling
-                        .slots
-                        .iter()
-                        .map(|opt| opt.as_ref().expect("all slots filled").clone())
-                        .collect();
-                    *self = BlockState::Sealed(SealedBlock {
-                        slots: sealed_slots.into(),
-                        footprint: filling.footprint,
-                    });
-                }
-                Ok(())
-            }
-            BlockState::Sealed(_) => Err(BlockInsertError::Sealed),
-        }
-    }
-
-    fn slot_has_block(&self, slot_id: usize) -> bool {
-        match self {
-            BlockState::Filling(filling) => filling.slot_has_block(slot_id),
-            BlockState::Sealed(sealed) => sealed.slot_has_block(slot_id),
-        }
-    }
-
-    fn get_slot(&self, slot_id: usize) -> Option<Arc<LayerBlock>> {
-        match self {
-            BlockState::Filling(filling) => filling.get_slot(slot_id),
-            BlockState::Sealed(sealed) => sealed.get_slot(slot_id),
-        }
-    }
-
-    fn is_complete(&self) -> bool {
-        matches!(self, BlockState::Sealed(_))
-    }
-
-    /// Total pinned memory occupied by all filled slots (O(1), cached on insert).
-    fn memory_footprint(&self) -> u64 {
-        match self {
-            BlockState::Filling(f) => f.footprint,
-            BlockState::Sealed(s) => s.footprint,
-        }
-    }
-}
-
-/// Wrapper for per-slot layer blocks with a fixed weight for cache eviction.
-pub struct Block {
-    inner: ShardedLock<BlockState>,
-}
-
-impl Block {
-    pub fn new(total_slots: usize) -> Self {
-        Self {
-            inner: ShardedLock::new(BlockState::Filling(FillingBlock::new(total_slots))),
-        }
-    }
-
-    pub fn insert_slot(
-        &self,
-        slot_id: usize,
-        block: Arc<LayerBlock>,
-        total_slots: usize,
-    ) -> Result<(), BlockInsertError> {
-        let mut state = self.inner.write().expect("block entry write lock poisoned");
-        state.insert_slot(slot_id, block, total_slots)
-    }
-
-    pub fn slot_has_block(&self, slot_id: usize) -> bool {
-        let state = self.inner.read().expect("block entry lock poisoned");
-        state.slot_has_block(slot_id)
-    }
-
-    pub fn get_slot(&self, slot_id: usize) -> Option<Arc<LayerBlock>> {
-        let state = self.inner.read().expect("block entry lock poisoned");
-        state.get_slot(slot_id)
-    }
-
-    pub fn is_complete(&self) -> bool {
-        let state = self.inner.read().expect("block entry lock poisoned");
-        state.is_complete()
-    }
-
-    /// Total pinned memory occupied by this block (sum of all filled slots).
     pub fn memory_footprint(&self) -> u64 {
-        self.inner
-            .read()
-            .expect("block lock poisoned")
-            .memory_footprint()
+        self.footprint
     }
 }
+
+// ============================================================================
+// LayerBlock (pinned memory holder)
+// ============================================================================
 
 /// CPU block data stored in pinned memory for a single layer/TP slot.
 pub struct LayerBlock {
@@ -348,9 +250,6 @@ impl LayerBlock {
     }
 
     /// Total pinned memory occupied by this layer block.
-    ///
-    /// For both contiguous and split layouts, `self.size` holds `block_size_bytes`
-    /// which equals `bytes_per_block * segments` (the total K+V size).
     pub fn memory_footprint(&self) -> u64 {
         self.size as u64
     }
@@ -360,9 +259,21 @@ impl LayerBlock {
 unsafe impl Send for LayerBlock {}
 unsafe impl Sync for LayerBlock {}
 
+// ============================================================================
+// StorageEngine
+// ============================================================================
+
 pub struct StorageEngine {
-    kv_storage: Arc<Mutex<LruCache<BlockKey, Arc<Block>>>>,
+    /// Pinned memory allocator
     pinned_pool: Arc<PinnedMemoryPool>,
+
+    /// Write path: blocks being filled (not yet sealed)
+    inflight: DashMap<BlockKey, Mutex<InflightBlock>>,
+
+    /// Read path: sealed blocks available for lookup
+    cache: Arc<Mutex<LruCache<BlockKey, Arc<SealedBlock>>>>,
+
+    /// Pre-eviction control
     pre_evict_stop: Arc<AtomicBool>,
     pre_evict_handle: Option<JoinHandle<()>>,
 }
@@ -374,7 +285,8 @@ impl StorageEngine {
         config: PreEvictConfig,
     ) -> Self {
         let pinned_pool = Arc::new(PinnedMemoryPool::new(capacity_bytes, use_hugepages));
-        let kv_storage = Arc::new(Mutex::new(LruCache::new_unbounded()));
+        let cache = Arc::new(Mutex::new(LruCache::new_unbounded()));
+        let inflight = DashMap::new();
         let pre_evict_stop = Arc::new(AtomicBool::new(false));
 
         let pre_evict_handle = if config.enabled {
@@ -386,23 +298,28 @@ impl StorageEngine {
             );
 
             let pool = Arc::clone(&pinned_pool);
-            let cache = Arc::clone(&kv_storage);
+            let cache_clone = Arc::clone(&cache);
             let stop = Arc::clone(&pre_evict_stop);
 
             Some(std::thread::spawn(move || {
-                Self::pre_evict_monitor(pool, cache, config, stop);
+                Self::pre_evict_monitor(pool, cache_clone, config, stop);
             }))
         } else {
             None
         };
 
         Self {
-            kv_storage,
             pinned_pool,
+            inflight,
+            cache,
             pre_evict_stop,
             pre_evict_handle,
         }
     }
+
+    // ========================================================================
+    // Allocation
+    // ========================================================================
 
     pub fn allocate(&self, size: NonZeroU64) -> Option<Arc<PinnedAllocation>> {
         loop {
@@ -427,24 +344,130 @@ impl StorageEngine {
         }
     }
 
-    fn reclaim(&self, target_objects: usize) -> usize {
-        Self::reclaim_from_cache_by_count(&self.kv_storage, target_objects)
+    // ========================================================================
+    // Write path (inflight)
+    // ========================================================================
+
+    /// Check if a slot exists in inflight blocks.
+    pub fn inflight_has_slot(&self, namespace: &str, block_hash: &[u8], slot_id: usize) -> bool {
+        let key = BlockKey::new(namespace.to_string(), block_hash.to_vec());
+        if let Some(entry) = self.inflight.get(&key) {
+            let block = entry.lock().unwrap();
+            block.slot_exists(slot_id)
+        } else {
+            false
+        }
     }
 
-    /// Reclaim blocks from the cache by count. Returns the number of blocks evicted.
-    fn reclaim_from_cache_by_count(
-        cache: &Mutex<LruCache<BlockKey, Arc<Block>>>,
-        target_objects: usize,
-    ) -> usize {
+    /// Insert a slot into a block. Handles:
+    /// - Skip if already in cache (sealed)
+    /// - Skip if slot already exists in inflight
+    /// - Create inflight block if needed
+    /// - Auto-seal and migrate to cache when complete
+    ///
+    /// Returns Ok(true) if the slot was actually inserted, Ok(false) if skipped.
+    pub fn insert_slot(
+        &self,
+        namespace: &str,
+        block_hash: BlockHash,
+        slot_id: usize,
+        block: Arc<LayerBlock>,
+        total_slots: usize,
+    ) -> Result<bool, BlockInsertError> {
+        let key = BlockKey::new(namespace.to_string(), block_hash);
+
+        // Fast path: already sealed in cache
+        {
+            let cache = self.cache.lock().unwrap();
+            if cache.contains_key(&key) {
+                return Ok(false);
+            }
+        }
+
+        // Get or create inflight block, insert slot, then release DashMap shard lock
+        let completed = {
+            let entry = self
+                .inflight
+                .entry(key.clone())
+                .or_insert_with(|| Mutex::new(InflightBlock::new(total_slots)));
+
+            let mut inflight_block = entry.lock().unwrap();
+
+            // Check if slot already exists
+            if inflight_block.slot_exists(slot_id) {
+                return Ok(false);
+            }
+
+            inflight_block.insert_slot(slot_id, block, total_slots)?
+        }; // entry dropped here, releasing DashMap shard lock
+
+        if completed {
+            // Seal and migrate to cache
+            // Remove from inflight first, then insert to cache
+            if let Some((_, mutex)) = self.inflight.remove(&key) {
+                let inflight_block = mutex.into_inner().unwrap();
+                let sealed = Arc::new(inflight_block.seal());
+
+                let mut cache = self.cache.lock().unwrap();
+                cache.insert(key, sealed);
+                core_metrics().cache_block_insertions.add(1, &[]);
+            }
+        }
+
+        Ok(true)
+    }
+
+    // ========================================================================
+    // Read path (cache)
+    // ========================================================================
+
+    /// Check if a block exists in the cache (sealed and complete).
+    pub fn cache_contains(&self, namespace: &str, block_hash: &[u8]) -> bool {
+        let key = BlockKey::new(namespace.to_string(), block_hash.to_vec());
+        let cache = self.cache.lock().unwrap();
+        cache.contains_key(&key)
+    }
+
+    /// Lookup multiple blocks from the cache.
+    /// Returns error if any block is missing.
+    pub fn cache_lookup_many(
+        &self,
+        namespace: &str,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<Vec<Arc<SealedBlock>>, String> {
+        let mut cache = self.cache.lock().unwrap();
+        let mut result = Vec::with_capacity(block_hashes.len());
+        for (idx, hash) in block_hashes.iter().enumerate() {
+            let key = BlockKey::new(namespace.to_string(), hash.clone());
+            let block = cache.get(&key).cloned().ok_or_else(|| {
+                format!(
+                    "missing KV block hash at index {idx} (namespace={namespace}, hash_len={})",
+                    hash.len()
+                )
+            })?;
+            result.push(block);
+        }
+        Ok(result)
+    }
+
+    // ========================================================================
+    // Eviction (cache only)
+    // ========================================================================
+
+    fn reclaim(&self, target_objects: usize) -> usize {
+        self.reclaim_from_cache_by_count(target_objects)
+    }
+
+    fn reclaim_from_cache_by_count(&self, target_objects: usize) -> usize {
         if target_objects == 0 {
             return 0;
         }
 
         let mut freed_entries = 0;
-        let mut cache_lock = cache.lock().unwrap();
+        let mut cache_lock = self.cache.lock().unwrap();
 
         while freed_entries < target_objects {
-            let Some((_hash, _layer_blocks)) = cache_lock.remove_lru() else {
+            let Some((_key, _block)) = cache_lock.remove_lru() else {
                 break;
             };
             freed_entries += 1;
@@ -461,9 +484,8 @@ impl StorageEngine {
         freed_entries
     }
 
-    /// Reclaim blocks from the cache by target bytes. Returns (blocks_freed, bytes_freed).
     fn reclaim_from_cache_by_bytes(
-        cache: &Mutex<LruCache<BlockKey, Arc<Block>>>,
+        cache: &Arc<Mutex<LruCache<BlockKey, Arc<SealedBlock>>>>,
         target_bytes: u64,
     ) -> (usize, u64) {
         if target_bytes == 0 {
@@ -475,7 +497,7 @@ impl StorageEngine {
         let mut cache_lock = cache.lock().unwrap();
 
         while freed_bytes < target_bytes {
-            let Some((_hash, block)) = cache_lock.remove_lru() else {
+            let Some((_key, block)) = cache_lock.remove_lru() else {
                 break;
             };
 
@@ -500,7 +522,7 @@ impl StorageEngine {
 
     fn pre_evict_monitor(
         pool: Arc<PinnedMemoryPool>,
-        cache: Arc<Mutex<LruCache<BlockKey, Arc<Block>>>>,
+        cache: Arc<Mutex<LruCache<BlockKey, Arc<SealedBlock>>>>,
         config: PreEvictConfig,
         stop: Arc<AtomicBool>,
     ) {
@@ -539,64 +561,6 @@ impl StorageEngine {
 
         debug!("Pre-eviction monitor thread stopped");
     }
-
-    pub fn slot_has_block(&self, namespace: &str, block_hash: &[u8], slot_id: usize) -> bool {
-        let key = BlockKey::new(namespace.to_string(), block_hash.to_vec());
-        let mut cache = self.kv_storage.lock().unwrap();
-        cache
-            .get(&key)
-            .map(|blocks| blocks.slot_has_block(slot_id))
-            .unwrap_or(false)
-    }
-
-    pub fn block_is_complete(&self, namespace: &str, block_hash: &[u8]) -> bool {
-        let key = BlockKey::new(namespace.to_string(), block_hash.to_vec());
-        let mut cache = self.kv_storage.lock().unwrap();
-        cache
-            .get(&key)
-            .map(|blocks| blocks.is_complete())
-            .unwrap_or(false)
-    }
-
-    pub fn insert_block(
-        &self,
-        namespace: &str,
-        block_hash: BlockHash,
-        slot_id: usize,
-        block: Arc<LayerBlock>,
-        total_slots: usize,
-    ) -> Result<(), BlockInsertError> {
-        let key = BlockKey::new(namespace.to_string(), block_hash.clone());
-        let mut cache = self.kv_storage.lock().unwrap();
-        let entry = cache.get(&key).cloned().unwrap_or_else(|| {
-            let new_blocks = Arc::new(Block::new(total_slots));
-            cache.insert(key.clone(), Arc::clone(&new_blocks));
-            // Record new block insertion into cache
-            core_metrics().cache_block_insertions.add(1, &[]);
-            new_blocks
-        });
-        entry.insert_slot(slot_id, block, total_slots)
-    }
-
-    pub fn lookup_many(
-        &self,
-        namespace: &str,
-        block_hashes: &[Vec<u8>],
-    ) -> Result<Vec<Arc<Block>>, String> {
-        let mut cache = self.kv_storage.lock().unwrap();
-        let mut result = Vec::with_capacity(block_hashes.len());
-        for (idx, hash) in block_hashes.iter().enumerate() {
-            let key = BlockKey::new(namespace.to_string(), hash.clone());
-            let shard_blocks = cache.get(&key).cloned().ok_or_else(|| {
-                format!(
-                    "missing KV block hash at index {idx} (namespace={namespace}, hash_len={})",
-                    hash.len()
-                )
-            })?;
-            result.push(shard_blocks);
-        }
-        Ok(result)
-    }
 }
 
 impl Drop for StorageEngine {
@@ -614,18 +578,19 @@ impl Drop for StorageEngine {
     }
 }
 
+// ============================================================================
+// Errors
+// ============================================================================
+
 #[derive(Debug)]
 pub enum BlockInsertError {
-    Sealed,
     SlotOutOfBounds { slot_id: usize, total_slots: usize },
-    SlotAlreadyFilled { slot_id: usize },
     SlotCountMismatch { expected: usize, got: usize },
 }
 
 impl fmt::Display for BlockInsertError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BlockInsertError::Sealed => write!(f, "block is sealed and read-only"),
             BlockInsertError::SlotOutOfBounds {
                 slot_id,
                 total_slots,
@@ -635,9 +600,6 @@ impl fmt::Display for BlockInsertError {
                     "slot_id {} out of bounds ({} slots)",
                     slot_id, total_slots
                 )
-            }
-            BlockInsertError::SlotAlreadyFilled { slot_id } => {
-                write!(f, "slot_id {} already has data", slot_id)
             }
             BlockInsertError::SlotCountMismatch { expected, got } => {
                 write!(f, "slot count mismatch: expected {}, got {}", expected, got)
