@@ -103,10 +103,8 @@ class VLLMServer:
                 "--port",
                 str(self.port),
                 "--trust-remote-code",
-                "--data-parallel-size",
-                "1",
-                "--prefix-caching-hash-algo",
-                "sha256_cbor",
+                "--block-size",
+                "64",
             ]
         )
 

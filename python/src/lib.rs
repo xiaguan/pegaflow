@@ -442,19 +442,27 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("load", r.status))
     }
 
-    /// Query prefix cache hits.
+    /// Query prefix cache hits with prefetch support.
     ///
     /// Args:
     ///     instance_id: Model instance ID
     ///     block_hashes: List of block hashes to check
     ///
-    /// Returns: (ok: bool, message: str, hit_blocks: int)
+    /// Returns: dict with keys:
+    ///     - ok: bool - whether the request succeeded
+    ///     - message: str - error message if failed
+    ///     - hit_blocks: int - number of blocks ready in cache
+    ///     - prefetch_state: str - one of "ready", "loading", "partial_miss"
+    ///     - loading_blocks: int - number of blocks being prefetched
+    ///     - missing_blocks: int - number of blocks not found in DFS
     fn query(
         &self,
         py: Python<'_>,
         instance_id: String,
         block_hashes: Vec<Vec<u8>>,
-    ) -> PyResult<(bool, String, usize)> {
+    ) -> PyResult<Py<pyo3::types::PyAny>> {
+        use pegaflow_proto::proto::engine::PrefetchState;
+
         self.call(py, |mut c| async move {
             let resp = c
                 .query(QueryRequest {
@@ -467,7 +475,27 @@ impl EngineRpcClient {
         .and_then(|r| {
             let (ok, msg) = status_tuple("query", r.status)?;
             let hit = u64_to_usize(r.hit_blocks, "hit_blocks")?;
-            Ok((ok, msg, hit))
+            let loading = u64_to_usize(r.loading_blocks, "loading_blocks")?;
+            let missing = u64_to_usize(r.missing_blocks, "missing_blocks")?;
+
+            let prefetch_state = match PrefetchState::try_from(r.prefetch_state) {
+                Ok(PrefetchState::PrefetchReady) => "ready",
+                Ok(PrefetchState::PrefetchLoading) => "loading",
+                Ok(PrefetchState::PrefetchPartialMiss) => "partial_miss",
+                _ => "ready", // Default to ready for unknown states
+            };
+
+            Python::attach(|py| {
+                use pyo3::types::PyDict;
+                let dict = PyDict::new(py);
+                dict.set_item("ok", ok)?;
+                dict.set_item("message", msg)?;
+                dict.set_item("hit_blocks", hit)?;
+                dict.set_item("prefetch_state", prefetch_state)?;
+                dict.set_item("loading_blocks", loading)?;
+                dict.set_item("missing_blocks", missing)?;
+                Ok(dict.into())
+            })
         })
     }
 

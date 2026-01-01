@@ -13,7 +13,6 @@
 // Eviction only targets the cache; inflight blocks are never evicted.
 // ============================================================================
 use bytesize::ByteSize;
-use crossbeam::channel::{self, Receiver, Sender};
 use dashmap::DashMap;
 use hashlink::LruCache;
 use std::fmt;
@@ -22,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, error, info};
 
 use crate::metrics::core_metrics;
@@ -186,6 +186,20 @@ impl SealedBlock {
     pub fn memory_footprint(&self) -> u64 {
         self.footprint
     }
+
+    /// Get all slots (for serialization)
+    pub fn slots(&self) -> &[Arc<LayerBlock>] {
+        &self.slots
+    }
+
+    /// Create from a vec of slots (for deserialization)
+    pub fn from_slots(slots: Vec<Arc<LayerBlock>>) -> Self {
+        let footprint = slots.iter().map(|s| s.memory_footprint()).sum();
+        Self {
+            slots: slots.into_boxed_slice(),
+            footprint,
+        }
+    }
 }
 
 // ============================================================================
@@ -282,7 +296,7 @@ pub struct StorageEngine {
     pre_evict_handle: Option<JoinHandle<()>>,
 
     /// Channel to notify consumers when blocks are sealed (for SSD offload)
-    seal_notify_tx: Option<Sender<SealNotification>>,
+    seal_notify_tx: Option<UnboundedSender<SealNotification>>,
 }
 
 impl StorageEngine {
@@ -292,14 +306,14 @@ impl StorageEngine {
         capacity_bytes: usize,
         use_hugepages: bool,
         config: PreEvictConfig,
-    ) -> (Self, Receiver<SealNotification>) {
+    ) -> (Self, UnboundedReceiver<SealNotification>) {
         let pinned_pool = Arc::new(PinnedMemoryPool::new(capacity_bytes, use_hugepages));
         let cache = Arc::new(Mutex::new(LruCache::new_unbounded()));
         let inflight = DashMap::new();
         let pre_evict_stop = Arc::new(AtomicBool::new(false));
 
         // Create unbounded channel for seal notifications
-        let (seal_notify_tx, seal_notify_rx) = channel::unbounded();
+        let (seal_notify_tx, seal_notify_rx) = mpsc::unbounded_channel();
 
         let pre_evict_handle = if config.enabled {
             info!(
@@ -469,6 +483,15 @@ impl StorageEngine {
             result.push(block);
         }
         Ok(result)
+    }
+
+    /// Insert a pre-built SealedBlock directly into the cache.
+    /// Used by prefetch to insert blocks loaded from DFS.
+    pub fn cache_insert(&self, namespace: &str, block_hash: Vec<u8>, block: Arc<SealedBlock>) {
+        let key = BlockKey::new(namespace.to_string(), block_hash);
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert(key, block);
+        core_metrics().cache_block_insertions.add(1, &[]);
     }
 
     // ========================================================================

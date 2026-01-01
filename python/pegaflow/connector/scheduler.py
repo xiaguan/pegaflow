@@ -49,6 +49,10 @@ class SchedulerConnector:
         lookup_end = time.perf_counter()
         elapsed_us = (lookup_end - lookup_start) * 1e6
 
+        # Prefetch in progress - tell scheduler to retry later
+        if hit_blocks is None:
+            return (None, False)
+
         computed_blocks = num_computed_tokens // self._ctx.block_size
 
         tracker.on_lookup(hit_blocks, computed_blocks)
@@ -214,10 +218,51 @@ class SchedulerConnector:
             )
         return self._trackers[req_id]
 
-    def _count_available_block_prefix(self, block_hashes: Iterable[bytes]) -> int:
-        ok, message, hit_blocks = self._ctx.engine_client.query(
+    def _count_available_block_prefix(
+        self, block_hashes: Iterable[bytes]
+    ) -> int | None:
+        """Query available blocks with prefetch support.
+
+        Returns:
+            int: Number of blocks ready in cache
+            None: Blocks are being prefetched from DFS, retry later
+        """
+        result = self._ctx.engine_client.query(
             self._ctx.instance_id, list(block_hashes)
         )
+
+        # Handle new dict response format
+        if isinstance(result, dict):
+            if not result.get("ok", False):
+                raise RuntimeError(
+                    f"Query failed: {result.get('message', 'unknown error')}"
+                )
+
+            prefetch_state = result.get("prefetch_state", "ready")
+            hit_blocks = result.get("hit_blocks", 0)
+            loading_blocks = result.get("loading_blocks", 0)
+            missing_blocks = result.get("missing_blocks", 0)
+
+            if prefetch_state == "loading":
+                logger.info(
+                    "[PegaKVConnector] Prefetch in progress: hit=%d loading=%d missing=%d",
+                    hit_blocks,
+                    loading_blocks,
+                    missing_blocks,
+                )
+                return None  # Signal scheduler to retry later
+
+            if prefetch_state == "partial_miss":
+                logger.debug(
+                    "[PegaKVConnector] Partial miss: hit=%d missing=%d",
+                    hit_blocks,
+                    missing_blocks,
+                )
+
+            return hit_blocks
+
+        # Legacy tuple response format (ok, message, hit_blocks)
+        ok, message, hit_blocks = result
         if not ok:
             raise RuntimeError(f"Query failed: {message}")
         return hit_blocks

@@ -62,9 +62,26 @@ message QueryRequest {
   repeated bytes block_hashes = 2;
 }
 
+// Prefetch status enum
+enum PrefetchState {
+  // All requested blocks are in local cache
+  PREFETCH_READY = 0;
+  // Some blocks are being prefetched from DFS
+  PREFETCH_LOADING = 1;
+  // Some blocks don't exist in DFS either
+  PREFETCH_PARTIAL_MISS = 2;
+}
+
 message QueryResponse {
   ResponseStatus status = 1;
+  // Number of blocks ready in cache (for backwards compatibility)
   uint64 hit_blocks = 2;
+  // Prefetch state for async prefetch support
+  PrefetchState prefetch_state = 3;
+  // Number of blocks currently being loaded from DFS
+  uint64 loading_blocks = 4;
+  // Number of blocks not found in DFS
+  uint64 missing_blocks = 5;
 }
 
 message UnregisterRequest {
