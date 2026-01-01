@@ -13,12 +13,13 @@
 // Eviction only targets the cache; inflight blocks are never evicted.
 // ============================================================================
 use bytesize::ByteSize;
+use crossbeam::channel::{self, Receiver, Sender};
 use dashmap::DashMap;
 use hashlink::LruCache;
 use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tracing::{debug, error, info};
@@ -263,6 +264,9 @@ unsafe impl Sync for LayerBlock {}
 // StorageEngine
 // ============================================================================
 
+/// Notification sent when a block is sealed (for SSD offload, etc.)
+pub type SealNotification = (BlockKey, Weak<SealedBlock>);
+
 pub struct StorageEngine {
     /// Pinned memory allocator
     pinned_pool: Arc<PinnedMemoryPool>,
@@ -276,18 +280,26 @@ pub struct StorageEngine {
     /// Pre-eviction control
     pre_evict_stop: Arc<AtomicBool>,
     pre_evict_handle: Option<JoinHandle<()>>,
+
+    /// Channel to notify consumers when blocks are sealed (for SSD offload)
+    seal_notify_tx: Option<Sender<SealNotification>>,
 }
 
 impl StorageEngine {
+    /// Create a new StorageEngine with optional seal notification channel.
+    /// Returns (engine, receiver) where receiver gets notified of sealed blocks.
     pub fn new_with_config(
         capacity_bytes: usize,
         use_hugepages: bool,
         config: PreEvictConfig,
-    ) -> Self {
+    ) -> (Self, Receiver<SealNotification>) {
         let pinned_pool = Arc::new(PinnedMemoryPool::new(capacity_bytes, use_hugepages));
         let cache = Arc::new(Mutex::new(LruCache::new_unbounded()));
         let inflight = DashMap::new();
         let pre_evict_stop = Arc::new(AtomicBool::new(false));
+
+        // Create unbounded channel for seal notifications
+        let (seal_notify_tx, seal_notify_rx) = channel::unbounded();
 
         let pre_evict_handle = if config.enabled {
             info!(
@@ -308,13 +320,17 @@ impl StorageEngine {
             None
         };
 
-        Self {
-            pinned_pool,
-            inflight,
-            cache,
-            pre_evict_stop,
-            pre_evict_handle,
-        }
+        (
+            Self {
+                pinned_pool,
+                inflight,
+                cache,
+                pre_evict_stop,
+                pre_evict_handle,
+                seal_notify_tx: Some(seal_notify_tx),
+            },
+            seal_notify_rx,
+        )
     }
 
     // ========================================================================
@@ -407,6 +423,11 @@ impl StorageEngine {
             if let Some((_, mutex)) = self.inflight.remove(&key) {
                 let inflight_block = mutex.into_inner().unwrap();
                 let sealed = Arc::new(inflight_block.seal());
+
+                // Notify SSD offload consumer (fire-and-forget)
+                if let Some(tx) = &self.seal_notify_tx {
+                    let _ = tx.send((key.clone(), Arc::downgrade(&sealed)));
+                }
 
                 let mut cache = self.cache.lock().unwrap();
                 cache.insert(key, sealed);

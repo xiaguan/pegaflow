@@ -3,12 +3,14 @@ pub mod gpu_worker;
 mod metrics;
 pub mod pinned_mem;
 pub mod pinned_pool;
+mod seal_offload;
 mod storage;
 pub mod sync_state;
 mod transfer;
 
 pub use pinned_pool::PinnedAllocation;
-pub use storage::PreEvictConfig;
+pub use seal_offload::spawn_seal_offload_task;
+pub use storage::{PreEvictConfig, SealNotification};
 pub use sync_state::{LoadState, LoadStateError};
 
 // ============================================================================
@@ -263,29 +265,41 @@ impl PegaEngine {
     /// Create a new PegaEngine instance with default pool size and regular pages
     #[instrument(level = "info")]
     pub fn new() -> Self {
-        Self::new_with_pool_size(DEFAULT_PINNED_POOL_BYTES, false)
+        let (engine, _rx) = Self::new_with_config(
+            DEFAULT_PINNED_POOL_BYTES,
+            false,
+            storage::PreEvictConfig::default(),
+        );
+        engine
     }
 
     /// Create a new PegaEngine instance with a custom pinned memory pool size
     ///
     /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
     pub fn new_with_pool_size(pool_size: usize, use_hugepages: bool) -> Self {
-        Self::new_with_config(pool_size, use_hugepages, storage::PreEvictConfig::default())
+        let (engine, _rx) =
+            Self::new_with_config(pool_size, use_hugepages, storage::PreEvictConfig::default());
+        engine
     }
 
     /// Create a new PegaEngine instance with custom pool size and pre-eviction config
     ///
     /// If `use_hugepages` is true, uses 2MB huge pages (requires system config).
+    /// Returns (engine, seal_notify_rx) - pass receiver to `spawn_seal_offload_task` for SSD offload.
     pub fn new_with_config(
         pool_size: usize,
         use_hugepages: bool,
         pre_evict_config: storage::PreEvictConfig,
-    ) -> Self {
-        let storage = StorageEngine::new_with_config(pool_size, use_hugepages, pre_evict_config);
-        PegaEngine {
-            instances: RwLock::new(HashMap::new()),
-            storage,
-        }
+    ) -> (Self, crossbeam::channel::Receiver<SealNotification>) {
+        let (storage, seal_notify_rx) =
+            StorageEngine::new_with_config(pool_size, use_hugepages, pre_evict_config);
+        (
+            PegaEngine {
+                instances: RwLock::new(HashMap::new()),
+                storage,
+            },
+            seal_notify_rx,
+        )
     }
 
     fn get_or_create_instance(

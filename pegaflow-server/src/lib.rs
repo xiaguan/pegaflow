@@ -204,11 +204,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pegaflow_core::PreEvictConfig::default()
     };
 
-    let engine = Arc::new(PegaEngine::new_with_config(
-        cli.pool_size,
-        cli.use_hugepages,
-        pre_evict_config,
-    ));
+    let (engine, seal_notify_rx) =
+        PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, pre_evict_config);
+    let engine = Arc::new(engine);
     let shutdown = Arc::new(Notify::new());
 
     let service = GrpcEngineService::new(engine, Arc::clone(&registry), Arc::clone(&shutdown));
@@ -223,6 +221,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let metrics_period = cli.metrics_period_secs;
 
     runtime.block_on(async move {
+        // Spawn the seal offload task (logs sealed blocks for now, future: SSD write-through)
+        let _offload_handle = pegaflow_core::spawn_seal_offload_task(seal_notify_rx);
+
         // Initialize OTEL metrics (requires Tokio runtime for gRPC)
         let meter_provider = init_metrics(metrics_endpoint, metrics_period)?;
 
