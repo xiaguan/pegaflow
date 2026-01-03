@@ -1,4 +1,5 @@
 pub mod allocator;
+mod cache;
 pub mod gpu_worker;
 mod metrics;
 pub mod pinned_mem;

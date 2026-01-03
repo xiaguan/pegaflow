@@ -11,6 +11,7 @@ pub(crate) struct CoreMetrics {
     pub cache_block_hits: Counter<u64>,
     pub cache_block_misses: Counter<u64>,
     pub cache_block_insertions: Counter<u64>,
+    pub cache_block_admission_rejections: Counter<u64>,
     pub cache_block_evictions: Counter<u64>,
 
     pub save_bytes: Counter<u64>,
@@ -52,6 +53,10 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             cache_block_insertions: meter
                 .u64_counter("pegaflow_cache_block_insertions_total")
                 .with_description("New blocks inserted into cache")
+                .build(),
+            cache_block_admission_rejections: meter
+                .u64_counter("pegaflow_cache_block_admission_rejections_total")
+                .with_description("Blocks rejected by cache admission policy")
                 .build(),
             cache_block_evictions: meter
                 .u64_counter("pegaflow_cache_block_evictions_total")
