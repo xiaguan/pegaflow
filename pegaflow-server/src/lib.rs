@@ -53,6 +53,10 @@ pub struct Cli {
     #[arg(long, default_value = "30gb", value_parser = parse_memory_size)]
     pub pool_size: usize,
 
+    /// Hint for typical value size (supports units: kb, mb, gb, tb); tunes cache + allocator
+    #[arg(long, value_parser = parse_memory_size)]
+    pub hint_value_size: Option<usize>,
+
     /// Use huge pages for pinned memory pool (faster allocation).
     /// Requires pre-configured huge pages via /proc/sys/vm/nr_hugepages
     #[arg(long, default_value_t = false)]
@@ -184,6 +188,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     })?;
     let registry = Arc::new(Mutex::new(registry));
 
+    if let Some(hint_value_size) = cli.hint_value_size {
+        if hint_value_size == 0 {
+            return Err("--hint-value-size must be greater than zero when set".into());
+        }
+        info!("Value size hint set to {} bytes", hint_value_size);
+    }
+
     info!(
         "Creating PegaEngine with pinned memory pool: {:.2} GiB ({} bytes), hugepages={}",
         cli.pool_size as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -227,6 +238,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let storage_config = pegaflow_core::StorageConfig {
         pre_evict_config,
         enable_lfu_admission: !cli.disable_lfu_admission,
+        hint_value_size_bytes: cli.hint_value_size,
     };
 
     if cli.disable_lfu_admission {

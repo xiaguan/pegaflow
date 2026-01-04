@@ -27,8 +27,6 @@ use crate::cache::TinyLfuCache;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 
-const RECLAIM_BATCH_OBJECTS: usize = 4096;
-
 /// Configuration for pre-eviction monitoring thread.
 #[derive(Debug, Clone)]
 pub struct PreEvictConfig {
@@ -69,6 +67,8 @@ impl PreEvictConfig {
 pub struct StorageConfig {
     pub pre_evict_config: PreEvictConfig,
     pub enable_lfu_admission: bool,
+    /// Optional hint for expected value size in bytes (tunes cache + allocator granularity)
+    pub hint_value_size_bytes: Option<usize>,
 }
 
 impl Default for StorageConfig {
@@ -76,6 +76,7 @@ impl Default for StorageConfig {
         Self {
             pre_evict_config: PreEvictConfig::default(),
             enable_lfu_admission: true,
+            hint_value_size_bytes: None,
         }
     }
 }
@@ -333,10 +334,16 @@ impl StorageEngine {
         config: impl Into<StorageConfig>,
     ) -> (Self, UnboundedReceiver<SealNotification>) {
         let config = config.into();
-        let pinned_pool = Arc::new(PinnedMemoryPool::new(capacity_bytes, use_hugepages));
+        let value_size_hint = config.hint_value_size_bytes.filter(|size| *size > 0);
+        let pinned_pool = Arc::new(PinnedMemoryPool::new(
+            capacity_bytes,
+            use_hugepages,
+            value_size_hint.and_then(|size| NonZeroU64::new(size as u64)),
+        ));
         let cache = Arc::new(Mutex::new(TinyLfuCache::new_unbounded(
             capacity_bytes,
             config.enable_lfu_admission,
+            value_size_hint,
         )));
         let inflight = DashMap::new();
         let pre_evict_stop = Arc::new(AtomicBool::new(false));
@@ -383,25 +390,32 @@ impl StorageEngine {
     // ========================================================================
 
     pub fn allocate(&self, size: NonZeroU64) -> Option<Arc<PinnedAllocation>> {
+        let requested_bytes = size.get();
+
         loop {
             if let Some(allocation) = self.pinned_pool.allocate(size) {
                 return Some(Arc::new(allocation));
             }
 
-            let reclaimed = self.reclaim(RECLAIM_BATCH_OBJECTS);
-            if reclaimed > 0 {
+            let (freed_blocks, freed_bytes, largest_free) =
+                self.reclaim_until_allocator_can_allocate(requested_bytes);
+
+            if largest_free >= requested_bytes {
                 continue;
-            } else {
-                let (used, total) = self.pinned_pool.usage();
-                error!(
-                    "Pinned memory pool exhausted! Requested: {}, Used: {}, Total: {}, Cache empty",
-                    ByteSize(size.get()),
-                    ByteSize(used),
-                    ByteSize(total)
-                );
-                core_metrics().pool_alloc_failures.add(1, &[]);
-                return None;
             }
+
+            let (used, total) = self.pinned_pool.usage();
+            error!(
+                requested = %ByteSize(requested_bytes),
+                used = %ByteSize(used),
+                total = %ByteSize(total),
+                largest_free = %ByteSize(largest_free),
+                freed_blocks,
+                freed_bytes = %ByteSize(freed_bytes),
+                "Pinned memory pool exhausted; cannot satisfy allocation"
+            );
+            core_metrics().pool_alloc_failures.add(1, &[]);
+            return None;
         }
     }
 
@@ -535,34 +549,47 @@ impl StorageEngine {
     // Eviction (cache only)
     // ========================================================================
 
-    fn reclaim(&self, target_objects: usize) -> usize {
-        self.reclaim_from_cache_by_count(target_objects)
-    }
-
-    fn reclaim_from_cache_by_count(&self, target_objects: usize) -> usize {
-        if target_objects == 0 {
-            return 0;
+    fn reclaim_until_allocator_can_allocate(&self, required_bytes: u64) -> (usize, u64, u64) {
+        if required_bytes == 0 {
+            return (0, 0, self.pinned_pool.largest_free_allocation());
         }
 
-        let mut freed_entries = 0;
-        let mut cache_lock = self.cache.lock().unwrap();
+        let mut freed_blocks = 0usize;
+        let mut freed_bytes = 0u64;
+        let mut largest_free = self.pinned_pool.largest_free_allocation();
 
-        while freed_entries < target_objects {
-            let Some((_key, _block)) = cache_lock.remove_lru() else {
+        while largest_free < required_bytes {
+            let maybe_entry = {
+                let mut cache_lock = self.cache.lock().unwrap();
+                cache_lock.remove_lru()
+            };
+
+            let Some((_key, block)) = maybe_entry else {
                 break;
             };
-            freed_entries += 1;
-        }
-        drop(cache_lock);
 
-        if freed_entries > 0 {
-            debug!(freed_entries, "Reclaimed blocks from cache");
+            let block_bytes = block.memory_footprint();
+            freed_bytes = freed_bytes.saturating_add(block_bytes);
+            freed_blocks += 1;
+            drop(block);
+
+            largest_free = self.pinned_pool.largest_free_allocation();
+        }
+
+        if freed_blocks > 0 {
+            debug!(
+                freed_blocks,
+                freed_bytes = %ByteSize(freed_bytes),
+                largest_free = %ByteSize(largest_free),
+                required = %ByteSize(required_bytes),
+                "Reclaimed cache blocks toward allocator request"
+            );
             core_metrics()
                 .cache_block_evictions
-                .add(freed_entries as u64, &[]);
+                .add(freed_blocks as u64, &[]);
         }
 
-        freed_entries
+        (freed_blocks, freed_bytes, largest_free)
     }
 
     fn reclaim_from_cache_by_bytes(

@@ -63,7 +63,8 @@ impl PinnedMemoryPool {
     /// Allocate a new pinned memory pool of `pool_size` bytes.
     ///
     /// If `use_hugepages` is true, uses huge pages (requires system config).
-    pub fn new(pool_size: usize, use_hugepages: bool) -> Self {
+    /// If `unit_size_hint` is provided, the allocator rounds allocations up to this size.
+    pub fn new(pool_size: usize, use_hugepages: bool, unit_size_hint: Option<NonZeroU64>) -> Self {
         if pool_size == 0 {
             panic!("Pinned memory pool size must be greater than zero");
         }
@@ -78,9 +79,23 @@ impl PinnedMemoryPool {
         };
 
         let actual_size = backing.size();
-        let allocator =
-            ScaledOffsetAllocator::new_with_max_allocs(actual_size as u64, Self::MAX_ALLOCS)
-                .expect("Failed to create memory allocator");
+        let allocator = match unit_size_hint {
+            Some(unit_size) => ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(
+                actual_size as u64,
+                unit_size.get(),
+                Self::MAX_ALLOCS,
+            )
+            .unwrap_or_else(|err| {
+                panic!(
+                    "Failed to create memory allocator with unit size {}: {}",
+                    unit_size, err
+                )
+            }),
+            None => {
+                ScaledOffsetAllocator::new_with_max_allocs(actual_size as u64, Self::MAX_ALLOCS)
+                    .expect("Failed to create memory allocator")
+            }
+        };
 
         Self {
             backing,
@@ -151,6 +166,12 @@ impl PinnedMemoryPool {
         let total = allocator.total_bytes();
         let used = total - report.total_free_bytes;
         (used, total)
+    }
+
+    /// Largest contiguous free region currently available, in bytes.
+    pub fn largest_free_allocation(&self) -> u64 {
+        let allocator = self.allocator.lock().unwrap();
+        allocator.storage_report().largest_free_allocation_bytes
     }
 }
 

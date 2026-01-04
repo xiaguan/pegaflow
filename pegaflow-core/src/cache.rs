@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::storage::{BlockKey, SealedBlock};
 
-const DEFAULT_BYTES_PER_VALUE: usize = 1024 * 1024; // heuristic: 1MB per block
+const DEFAULT_BYTES_PER_VALUE: usize = 128 * 1024 * 1024; // heuristic: 1MB per block
 
 /// LRU cache with TinyLFU-based admission. Keeps API surface tiny to avoid
 /// bloating storage.rs.
@@ -16,8 +16,15 @@ pub(crate) struct TinyLfuCache<K, V> {
 }
 
 impl TinyLfuCache<BlockKey, ArcSealedBlock> {
-    pub fn new_unbounded(capacity_bytes: usize, enable_lfu_admission: bool) -> Self {
-        let estimated_items = std::cmp::max(1, capacity_bytes / DEFAULT_BYTES_PER_VALUE);
+    pub fn new_unbounded(
+        capacity_bytes: usize,
+        enable_lfu_admission: bool,
+        bytes_per_value_hint: Option<usize>,
+    ) -> Self {
+        let bytes_per_value = bytes_per_value_hint
+            .filter(|size| *size > 0)
+            .unwrap_or(DEFAULT_BYTES_PER_VALUE);
+        let estimated_items = std::cmp::max(1, capacity_bytes / bytes_per_value);
         Self {
             lru: LruCache::new_unbounded(),
             freq: enable_lfu_admission.then(|| TinyLfu::new(estimated_items)),
