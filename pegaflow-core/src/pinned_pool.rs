@@ -79,6 +79,15 @@ impl PinnedMemoryPool {
         };
 
         let actual_size = backing.size();
+        let metrics = core_metrics();
+        if let Ok(capacity_i64) = i64::try_from(actual_size) {
+            metrics.pool_capacity_bytes.add(capacity_i64, &[]);
+        } else {
+            error!(
+                capacity_bytes = actual_size,
+                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric update"
+            );
+        }
         let allocator = match unit_size_hint {
             Some(unit_size) => ScaledOffsetAllocator::new_with_unit_size_and_max_allocs(
                 actual_size as u64,
@@ -172,6 +181,21 @@ impl PinnedMemoryPool {
     pub fn largest_free_allocation(&self) -> u64 {
         let allocator = self.allocator.lock().unwrap();
         allocator.storage_report().largest_free_allocation_bytes
+    }
+}
+
+impl Drop for PinnedMemoryPool {
+    fn drop(&mut self) {
+        let metrics = core_metrics();
+        let capacity_bytes = self.backing.size();
+        if let Ok(capacity_i64) = i64::try_from(capacity_bytes) {
+            metrics.pool_capacity_bytes.add(-capacity_i64, &[]);
+        } else {
+            error!(
+                capacity_bytes,
+                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric cleanup"
+            );
+        }
     }
 }
 

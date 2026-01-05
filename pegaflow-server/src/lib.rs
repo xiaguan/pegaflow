@@ -1,3 +1,4 @@
+pub mod metric;
 pub mod proto;
 pub mod registry;
 pub mod service;
@@ -245,19 +246,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         info!("TinyLFU cache admission disabled; falling back to plain LRU inserts");
     }
 
-    let (engine, seal_notify_rx) =
-        PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, storage_config);
-    let engine = Arc::new(engine);
-    let shutdown = Arc::new(Notify::new());
-
-    // Now create and start Tokio runtime after CUDA initialization
-    // Using multi-thread runtime since GPU operations now run in dedicated worker threads
+    // Create Tokio runtime early - needed for OTLP metrics gRPC exporter
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
-    let metrics_endpoint = cli.metrics_otel_endpoint.clone();
-    let metrics_period = cli.metrics_period_secs;
+    // Initialize OTEL metrics BEFORE creating PegaEngine, so that core metrics
+    // (pool, cache, save/load) use the real meter provider instead of noop.
+    let meter_provider = runtime.block_on(async {
+        init_metrics(cli.metrics_otel_endpoint.clone(), cli.metrics_period_secs)
+    })?;
+
+    let (engine, seal_notify_rx) =
+        PegaEngine::new_with_config(cli.pool_size, cli.use_hugepages, storage_config);
+    let engine = Arc::new(engine);
+    let shutdown = Arc::new(Notify::new());
 
     runtime.block_on(async move {
         // Create service - with or without DFS support depending on redis config
@@ -298,9 +301,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 Arc::clone(&shutdown),
             )
         };
-
-        // Initialize OTEL metrics (requires Tokio runtime for gRPC)
-        let meter_provider = init_metrics(metrics_endpoint, metrics_period)?;
 
         let shutdown_signal = {
             let notify = Arc::clone(&shutdown);

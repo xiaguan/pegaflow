@@ -13,13 +13,18 @@ PegaFlow Server → OpenTelemetry Collector → Prometheus → Grafana
 
 ## Available Metrics
 
-PegaFlow exposes 10 core metrics for monitoring KV cache operations:
+PegaFlow exposes 11 core metrics for monitoring KV cache operations:
 
 ### Pool Metrics (Pinned Memory)
 - **pegaflow_pool_used_bytes** (UpDownCounter)
   - Current pinned memory pool usage in bytes
   - Type: Gauge-like (tracks allocation deltas)
   - Use case: Monitor memory pressure
+
+- **pegaflow_pool_capacity_bytes** (UpDownCounter)
+  - Total pinned memory pool capacity in bytes (emitted once per pool lifecycle)
+  - Type: Gauge-like (set on pool creation, cleared on drop)
+  - Use case: Derive pool utilization without manual dashboard constants
 
 - **pegaflow_pool_alloc_failures_total** (Counter)
   - Total allocation failures after eviction retries

@@ -27,6 +27,19 @@ use crate::cache::TinyLfuCache;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedMemoryPool};
 
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Default pre-eviction threshold: start evicting when free space drops below this (5GB)
+const DEFAULT_PRE_EVICT_THRESHOLD_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Default pre-eviction target: target free space after eviction completes (8GB)
+const DEFAULT_PRE_EVICT_TARGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Default interval for checking pool usage in pre-eviction monitor (ms)
+const DEFAULT_PRE_EVICT_CHECK_INTERVAL_MS: u64 = 100;
+/// Number of LRU blocks to evict per iteration when reclaiming memory
+const RECLAIM_BATCH_SIZE: usize = 64;
+
 /// Configuration for pre-eviction monitoring thread.
 #[derive(Debug, Clone)]
 pub struct PreEvictConfig {
@@ -44,9 +57,9 @@ impl Default for PreEvictConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            threshold_bytes: 5 * 1024 * 1024 * 1024, // 5GB
-            target_bytes: 8 * 1024 * 1024 * 1024,    // 8GB
-            check_interval_ms: 100,
+            threshold_bytes: DEFAULT_PRE_EVICT_THRESHOLD_BYTES,
+            target_bytes: DEFAULT_PRE_EVICT_TARGET_BYTES,
+            check_interval_ms: DEFAULT_PRE_EVICT_CHECK_INTERVAL_MS,
         }
     }
 }
@@ -557,21 +570,23 @@ impl StorageEngine {
         let mut freed_blocks = 0usize;
         let mut freed_bytes = 0u64;
         let mut largest_free = self.pinned_pool.largest_free_allocation();
-
         while largest_free < required_bytes {
-            let maybe_entry = {
+            // Collect evicted blocks under lock, then drop outside lock
+            let evicted: Vec<_> = {
                 let mut cache_lock = self.cache.lock().unwrap();
-                cache_lock.remove_lru()
+                (0..RECLAIM_BATCH_SIZE)
+                    .map_while(|_| cache_lock.remove_lru())
+                    .collect()
             };
 
-            let Some((_key, block)) = maybe_entry else {
+            if evicted.is_empty() {
                 break;
-            };
+            }
 
-            let block_bytes = block.memory_footprint();
-            freed_bytes = freed_bytes.saturating_add(block_bytes);
-            freed_blocks += 1;
-            drop(block);
+            for (_key, block) in evicted {
+                freed_bytes = freed_bytes.saturating_add(block.memory_footprint());
+                freed_blocks += 1;
+            }
 
             largest_free = self.pinned_pool.largest_free_allocation();
         }
