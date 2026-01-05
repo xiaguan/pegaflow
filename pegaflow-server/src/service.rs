@@ -1,3 +1,4 @@
+use crate::metric::record_rpc_result;
 use crate::proto::engine::engine_server::Engine;
 use crate::proto::engine::{
     HealthRequest, HealthResponse, LoadRequest, LoadResponse, PrefetchState, QueryRequest,
@@ -10,6 +11,7 @@ use pegaflow_core::{EngineError, PegaEngine, PrefetchStatus, PrefetchTracker};
 use pyo3::{PyErr, Python};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Notify;
 use tonic::{async_trait, Request, Response, Status};
 use tracing::{info, instrument, warn};
@@ -139,36 +141,43 @@ impl Engine for GrpcEngineService {
         &self,
         request: Request<RegisterContextRequest>,
     ) -> Result<Response<RegisterContextResponse>, Status> {
-        let req = request.into_inner();
-        let metadata = self.handle_tensor_registration(&req)?;
+        let start = Instant::now();
+        let result: Result<Response<RegisterContextResponse>, Status> = async {
+            let req = request.into_inner();
+            let metadata = self.handle_tensor_registration(&req)?;
 
-        let num_blocks = Self::usize_from_u64(req.num_blocks, "num_blocks")?;
-        let bytes_per_block = Self::usize_from_u64(req.bytes_per_block, "bytes_per_block")?;
-        let kv_stride_bytes = Self::usize_from_u64(req.kv_stride_bytes, "kv_stride_bytes")?;
-        let segments = Self::usize_from_u32(req.segments, "segments")?;
-        let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
-        let tp_size = Self::usize_from_u32(req.tp_size, "tp_size")?;
-        let num_layers = Self::usize_from_u32(req.num_layers, "num_layers")?;
+            let num_blocks = Self::usize_from_u64(req.num_blocks, "num_blocks")?;
+            let bytes_per_block = Self::usize_from_u64(req.bytes_per_block, "bytes_per_block")?;
+            let kv_stride_bytes = Self::usize_from_u64(req.kv_stride_bytes, "kv_stride_bytes")?;
+            let segments = Self::usize_from_u32(req.segments, "segments")?;
+            let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
+            let tp_size = Self::usize_from_u32(req.tp_size, "tp_size")?;
+            let num_layers = Self::usize_from_u32(req.num_layers, "num_layers")?;
 
-        self.engine
-            .register_context_layer(
-                &req.instance_id,
-                &req.namespace,
-                metadata.device_id,
-                req.layer_name.clone(),
-                metadata.data_ptr,
-                metadata.size_bytes,
-                num_blocks,
-                bytes_per_block,
-                kv_stride_bytes,
-                segments,
-                tp_rank,
-                tp_size,
-                num_layers,
-            )
-            .map_err(Self::map_engine_error)?;
+            self.engine
+                .register_context_layer(
+                    &req.instance_id,
+                    &req.namespace,
+                    metadata.device_id,
+                    req.layer_name.clone(),
+                    metadata.data_ptr,
+                    metadata.size_bytes,
+                    num_blocks,
+                    bytes_per_block,
+                    kv_stride_bytes,
+                    segments,
+                    tp_rank,
+                    tp_size,
+                    num_layers,
+                )
+                .map_err(Self::map_engine_error)?;
 
-        Ok(Response::new(Self::build_register_context_response()))
+            Ok(Response::new(Self::build_register_context_response()))
+        }
+        .await;
+
+        record_rpc_result("register_context", &result, start);
+        result
     }
 
     #[instrument(
@@ -177,23 +186,30 @@ impl Engine for GrpcEngineService {
         fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layers=%request.get_ref().saves.len())
     )]
     async fn save(&self, request: Request<SaveRequest>) -> Result<Response<SaveResponse>, Status> {
-        let req = request.into_inner();
-        let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
+        let start = Instant::now();
+        let result: Result<Response<SaveResponse>, Status> = async {
+            let req = request.into_inner();
+            let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
 
-        let saves = req
-            .saves
-            .into_iter()
-            .map(|layer| (layer.layer_name, layer.block_ids, layer.block_hashes))
-            .collect();
+            let saves = req
+                .saves
+                .into_iter()
+                .map(|layer| (layer.layer_name, layer.block_ids, layer.block_hashes))
+                .collect();
 
-        self.engine
-            .batch_save_kv_blocks_from_ipc(&req.instance_id, tp_rank, req.device_id, saves)
-            .await
-            .map_err(Self::map_engine_error)?;
+            self.engine
+                .batch_save_kv_blocks_from_ipc(&req.instance_id, tp_rank, req.device_id, saves)
+                .await
+                .map_err(Self::map_engine_error)?;
 
-        Ok(Response::new(SaveResponse {
-            status: Some(Self::build_simple_response()),
-        }))
+            Ok(Response::new(SaveResponse {
+                status: Some(Self::build_simple_response()),
+            }))
+        }
+        .await;
+
+        record_rpc_result("save", &result, start);
+        result
     }
 
     #[instrument(
@@ -202,28 +218,35 @@ impl Engine for GrpcEngineService {
         fields(instance=%request.get_ref().instance_id, tp_rank=%request.get_ref().tp_rank, device=%request.get_ref().device_id, layers=%request.get_ref().layer_names.len(), blocks=%request.get_ref().block_ids.len())
     )]
     async fn load(&self, request: Request<LoadRequest>) -> Result<Response<LoadResponse>, Status> {
-        let req = request.into_inner();
-        let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
-        let layer_names = req.layer_names;
-        let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
-        let block_ids = req.block_ids;
-        let block_hashes = req.block_hashes;
+        let start = Instant::now();
+        let result: Result<Response<LoadResponse>, Status> = async {
+            let req = request.into_inner();
+            let tp_rank = Self::usize_from_u32(req.tp_rank, "tp_rank")?;
+            let layer_names = req.layer_names;
+            let layer_refs: Vec<&str> = layer_names.iter().map(|s| s.as_str()).collect();
+            let block_ids = req.block_ids;
+            let block_hashes = req.block_hashes;
 
-        self.engine
-            .batch_load_kv_blocks_multi_layer(
-                &req.instance_id,
-                tp_rank,
-                req.device_id,
-                &req.load_state_shm,
-                &layer_refs,
-                &block_ids,
-                &block_hashes,
-            )
-            .map_err(Self::map_engine_error)?;
+            self.engine
+                .batch_load_kv_blocks_multi_layer(
+                    &req.instance_id,
+                    tp_rank,
+                    req.device_id,
+                    &req.load_state_shm,
+                    &layer_refs,
+                    &block_ids,
+                    &block_hashes,
+                )
+                .map_err(Self::map_engine_error)?;
 
-        Ok(Response::new(LoadResponse {
-            status: Some(Self::build_simple_response()),
-        }))
+            Ok(Response::new(LoadResponse {
+                status: Some(Self::build_simple_response()),
+            }))
+        }
+        .await;
+
+        record_rpc_result("load", &result, start);
+        result
     }
 
     #[instrument(
@@ -236,63 +259,70 @@ impl Engine for GrpcEngineService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        let req = request.into_inner();
+        let start = Instant::now();
+        let result: Result<Response<QueryResponse>, Status> = async {
+            let req = request.into_inner();
 
-        // If DFS is enabled, use async prefetch-aware query
-        if let (Some(redis_conn), Some(tracker), Some(dfs_root)) =
-            (&self.redis_conn, &self.prefetch_tracker, &self.dfs_root)
-        {
-            let mut conn = redis_conn.lock().await;
-            let status = self
-                .engine
-                .count_prefix_hit_blocks_async(
-                    &req.instance_id,
-                    &req.block_hashes,
-                    &mut conn,
-                    tracker,
-                    dfs_root,
-                )
-                .await
-                .map_err(Self::map_engine_error)?;
+            // If DFS is enabled, use async prefetch-aware query
+            if let (Some(redis_conn), Some(tracker), Some(dfs_root)) =
+                (&self.redis_conn, &self.prefetch_tracker, &self.dfs_root)
+            {
+                let mut conn = redis_conn.lock().await;
+                let status = self
+                    .engine
+                    .count_prefix_hit_blocks_async(
+                        &req.instance_id,
+                        &req.block_hashes,
+                        &mut conn,
+                        tracker,
+                        dfs_root,
+                    )
+                    .await
+                    .map_err(Self::map_engine_error)?;
 
-            let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
-                PrefetchStatus::Ready(n) => (PrefetchState::PrefetchReady, n as u64, 0, 0),
-                PrefetchStatus::Prefetching { ready, loading } => (
-                    PrefetchState::PrefetchLoading,
-                    ready as u64,
-                    loading as u64,
-                    0,
-                ),
-                PrefetchStatus::PartialMiss { ready, missing } => (
-                    PrefetchState::PrefetchPartialMiss,
-                    ready as u64,
-                    0,
-                    missing as u64,
-                ),
-            };
+                let (prefetch_state, hit_blocks, loading_blocks, missing_blocks) = match status {
+                    PrefetchStatus::Ready(n) => (PrefetchState::PrefetchReady, n as u64, 0, 0),
+                    PrefetchStatus::Prefetching { ready, loading } => (
+                        PrefetchState::PrefetchLoading,
+                        ready as u64,
+                        loading as u64,
+                        0,
+                    ),
+                    PrefetchStatus::PartialMiss { ready, missing } => (
+                        PrefetchState::PrefetchPartialMiss,
+                        ready as u64,
+                        0,
+                        missing as u64,
+                    ),
+                };
 
-            Ok(Response::new(QueryResponse {
-                status: Some(Self::build_simple_response()),
-                hit_blocks,
-                prefetch_state: prefetch_state.into(),
-                loading_blocks,
-                missing_blocks,
-            }))
-        } else {
-            // Fallback to sync query (no DFS)
-            let hit_blocks = self
-                .engine
-                .count_prefix_hit_blocks(&req.instance_id, &req.block_hashes)
-                .map_err(Self::map_engine_error)?;
+                Ok(Response::new(QueryResponse {
+                    status: Some(Self::build_simple_response()),
+                    hit_blocks,
+                    prefetch_state: prefetch_state.into(),
+                    loading_blocks,
+                    missing_blocks,
+                }))
+            } else {
+                // Fallback to sync query (no DFS)
+                let hit_blocks = self
+                    .engine
+                    .count_prefix_hit_blocks(&req.instance_id, &req.block_hashes)
+                    .map_err(Self::map_engine_error)?;
 
-            Ok(Response::new(QueryResponse {
-                status: Some(Self::build_simple_response()),
-                hit_blocks: hit_blocks as u64,
-                prefetch_state: PrefetchState::PrefetchReady.into(),
-                loading_blocks: 0,
-                missing_blocks: 0,
-            }))
+                Ok(Response::new(QueryResponse {
+                    status: Some(Self::build_simple_response()),
+                    hit_blocks: hit_blocks as u64,
+                    prefetch_state: PrefetchState::PrefetchReady.into(),
+                    loading_blocks: 0,
+                    missing_blocks: 0,
+                }))
+            }
         }
+        .await;
+
+        record_rpc_result("query", &result, start);
+        result
     }
 
     #[instrument(
@@ -304,25 +334,32 @@ impl Engine for GrpcEngineService {
         &self,
         request: Request<UnregisterRequest>,
     ) -> Result<Response<UnregisterResponse>, Status> {
-        let req = request.into_inner();
-        let removed = {
-            let mut registry = self.registry.lock();
-            registry.drop_instance(&req.instance_id)
-        };
-        if removed > 0 {
-            info!(
-                "Dropped {} CUDA tensors for instance {}",
-                removed, req.instance_id
-            );
+        let start = Instant::now();
+        let result: Result<Response<UnregisterResponse>, Status> = async {
+            let req = request.into_inner();
+            let removed = {
+                let mut registry = self.registry.lock();
+                registry.drop_instance(&req.instance_id)
+            };
+            if removed > 0 {
+                info!(
+                    "Dropped {} CUDA tensors for instance {}",
+                    removed, req.instance_id
+                );
+            }
+
+            self.engine
+                .unregister_instance(&req.instance_id)
+                .map_err(Self::map_engine_error)?;
+
+            Ok(Response::new(UnregisterResponse {
+                status: Some(Self::build_simple_response()),
+            }))
         }
+        .await;
 
-        self.engine
-            .unregister_instance(&req.instance_id)
-            .map_err(Self::map_engine_error)?;
-
-        Ok(Response::new(UnregisterResponse {
-            status: Some(Self::build_simple_response()),
-        }))
+        record_rpc_result("unregister_context", &result, start);
+        result
     }
 
     #[instrument(level = "info", skip(self, _request))]
@@ -330,16 +367,23 @@ impl Engine for GrpcEngineService {
         &self,
         _request: Request<ShutdownRequest>,
     ) -> Result<Response<ShutdownResponse>, Status> {
-        {
-            let mut registry = self.registry.lock();
-            registry.clear();
-        }
-        warn!("Shutdown requested via RPC");
-        self.shutdown.notify_waiters();
+        let start = Instant::now();
+        let result: Result<Response<ShutdownResponse>, Status> = async {
+            {
+                let mut registry = self.registry.lock();
+                registry.clear();
+            }
+            warn!("Shutdown requested via RPC");
+            self.shutdown.notify_waiters();
 
-        Ok(Response::new(ShutdownResponse {
-            status: Some(Self::build_simple_response()),
-        }))
+            Ok(Response::new(ShutdownResponse {
+                status: Some(Self::build_simple_response()),
+            }))
+        }
+        .await;
+
+        record_rpc_result("shutdown", &result, start);
+        result
     }
 
     #[instrument(level = "info", skip(self, _request))]
@@ -347,8 +391,15 @@ impl Engine for GrpcEngineService {
         &self,
         _request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
-        Ok(Response::new(HealthResponse {
-            status: Some(Self::build_simple_response()),
-        }))
+        let start = Instant::now();
+        let result: Result<Response<HealthResponse>, Status> = async {
+            Ok(Response::new(HealthResponse {
+                status: Some(Self::build_simple_response()),
+            }))
+        }
+        .await;
+
+        record_rpc_result("health", &result, start);
+        result
     }
 }

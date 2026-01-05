@@ -6,7 +6,22 @@ use std::sync::Arc;
 
 use crate::storage::{BlockKey, SealedBlock};
 
-const DEFAULT_BYTES_PER_VALUE: usize = 128 * 1024 * 1024; // heuristic: 1MB per block
+// ============================================================================
+// Constants
+// ============================================================================
+
+/// Default assumed size per cached value for estimating item count (128MB)
+const DEFAULT_BYTES_PER_VALUE: usize = 128 * 1024 * 1024;
+/// Minimum number of slots (columns) in the CM-Sketch estimator
+const MIN_ESTIMATOR_SLOTS: usize = 16;
+/// Minimum number of hash functions (rows) in the CM-Sketch estimator
+const MIN_ESTIMATOR_HASHES: usize = 2;
+/// Divisor for compact estimator (uses 1/100th the slots of optimal)
+const COMPACT_ESTIMATOR_DIVISOR: usize = 100;
+/// Multiplier for TinyLFU window limit relative to cache size
+const WINDOW_LIMIT_MULTIPLIER: usize = 8;
+/// Number of bits to right-shift counters during aging
+const AGE_SHIFT_BITS: u8 = 1;
 
 /// LRU cache with TinyLFU-based admission. Keeps API surface tiny to avoid
 /// bloating storage.rs.
@@ -95,8 +110,14 @@ impl Estimator {
         let error_range = 1.0 / (items as f64);
         let failure_probability = 1.0 / (items as f64);
         (
-            max((std::f64::consts::E / error_range).ceil() as usize, 16),
-            max((failure_probability.ln() / 0.5f64.ln()).ceil() as usize, 2),
+            max(
+                (std::f64::consts::E / error_range).ceil() as usize,
+                MIN_ESTIMATOR_SLOTS,
+            ),
+            max(
+                (failure_probability.ln() / 0.5f64.ln()).ceil() as usize,
+                MIN_ESTIMATOR_HASHES,
+            ),
         )
     }
 
@@ -106,7 +127,7 @@ impl Estimator {
     }
 
     fn compact(items: usize) -> Self {
-        let (slots, hashes) = Self::optimal_paras(items / 100);
+        let (slots, hashes) = Self::optimal_paras(items / COMPACT_ESTIMATOR_DIVISOR);
         Self::new(hashes, slots, RandomState::new)
     }
 
@@ -197,7 +218,7 @@ impl TinyLfu {
         let window_size = self.window_counter.fetch_add(1, Ordering::Relaxed);
         if window_size == self.window_limit || window_size > self.window_limit * 2 {
             self.window_counter.store(0, Ordering::Relaxed);
-            self.estimator.age(1); // right shift 1 bit
+            self.estimator.age(AGE_SHIFT_BITS);
         }
         self.estimator.incr(key)
     }
@@ -207,7 +228,7 @@ impl TinyLfu {
         Self {
             estimator: Estimator::optimal(cache_size),
             window_counter: Default::default(),
-            window_limit: cache_size * 8,
+            window_limit: cache_size * WINDOW_LIMIT_MULTIPLIER,
         }
     }
 
@@ -216,7 +237,7 @@ impl TinyLfu {
         Self {
             estimator: Estimator::compact(cache_size),
             window_counter: Default::default(),
-            window_limit: cache_size * 8,
+            window_limit: cache_size * WINDOW_LIMIT_MULTIPLIER,
         }
     }
 }
